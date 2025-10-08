@@ -74,6 +74,7 @@ COMMAND_SUGGESTIONS = []
 GLOBAL_USERNAME = None
 GLOBAL_PASSWORD = None
 GLOBAL_PLAINTEXT_PASSWORD = None
+GLOBAL_AUTH_METHOD = None
 
 # --- Colors ---
 # ANSI escape codes for colored output
@@ -155,7 +156,7 @@ def show_menu() -> None:
         ("download <remote_path> <local_path>", "Download a file"),
         ("loadps <local_path>.ps1", "Load PowerShell functions from a local script"),
         ("runps <local_path>.ps1", "Run a local PowerShell script on the remote host"),
-        ("interactive", "Enter interactive logon mode (requires plaintext password)"),
+        ("interactive", "Enter interactive logon mode"),
         ("menu", "Show this menu"),
         ("clear, cls", "Clear the screen"),
         ("exit", "Exit the shell"),
@@ -875,9 +876,15 @@ def interactive_mode_shell(r_pool: RunspacePool, use_netonly: bool = False) -> N
         use_netonly: If True, use LOGON_NETCREDENTIALS_ONLY (network credentials only).
                      If False, use interactive logon with full credentials.
     """
-    global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD
+    global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD, GLOBAL_AUTH_METHOD
     
-    mode = "netonly" if use_netonly else "interactive"
+    # Determine the mode based on authentication method
+    if GLOBAL_AUTH_METHOD == "kerberos":
+        mode = "kerberos"
+    elif use_netonly:
+        mode = "netonly"
+    else:
+        mode = "interactive"
     log.info(f"Starting {mode} mode shell...")
     
     # Set up history file
@@ -917,21 +924,28 @@ def interactive_mode_shell(r_pool: RunspacePool, use_netonly: bool = False) -> N
                 continue
             else:
                 try:
-                    # Escape single quotes in the command for PowerShell
-                    escaped_command = command.replace("'", "''")
-                    
-                    # Determine which password to use and escape single quotes
-                    password_to_use = GLOBAL_PLAINTEXT_PASSWORD if not use_netonly else GLOBAL_PASSWORD
-                    if not password_to_use:
-                        print(RED + "[-] No password available for interactive mode." + RESET)
-                        continue
-                    escaped_password = password_to_use.replace("'", "''")
-                    escaped_username = GLOBAL_USERNAME.replace("'", "''")
-                    
-                    # Build the PowerShell script to execute command with interactive logon
-                    # Using Start-Process with -Credential creates a new process with CreateProcessWithLogonW
-                    # which provides interactive logon type (LOGON_WITH_PROFILE)
-                    ps_script = f"""
+                    # For Kerberos authentication, execute command directly in current context
+                    if GLOBAL_AUTH_METHOD == "kerberos":
+                        ps = PowerShell(r_pool)
+                        ps.add_script(command)
+                        ps.begin_invoke()
+                        log.info(f"Executing command in {mode} mode: {command}")
+                    else:
+                        # Escape single quotes in the command for PowerShell
+                        escaped_command = command.replace("'", "''")
+                        
+                        # Determine which password to use and escape single quotes
+                        password_to_use = GLOBAL_PLAINTEXT_PASSWORD if not use_netonly else GLOBAL_PASSWORD
+                        if not password_to_use:
+                            print(RED + "[-] No password available for interactive mode." + RESET)
+                            continue
+                        escaped_password = password_to_use.replace("'", "''")
+                        escaped_username = GLOBAL_USERNAME.replace("'", "''")
+                        
+                        # Build the PowerShell script to execute command with interactive logon
+                        # Using Start-Process with -Credential creates a new process with CreateProcessWithLogonW
+                        # which provides interactive logon type (LOGON_WITH_PROFILE)
+                        ps_script = f"""
 $password = ConvertTo-SecureString '{escaped_password}' -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential('{escaped_username}', $password)
 Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', '{escaped_command}' -Credential $cred -NoNewWindow -Wait -RedirectStandardOutput $env:TEMP\\out.txt -RedirectStandardError $env:TEMP\\err.txt
@@ -940,11 +954,11 @@ Get-Content $env:TEMP\\err.txt -ErrorAction SilentlyContinue | Write-Error
 Remove-Item $env:TEMP\\out.txt -ErrorAction SilentlyContinue
 Remove-Item $env:TEMP\\err.txt -ErrorAction SilentlyContinue
 """
-                    
-                    ps = PowerShell(r_pool)
-                    ps.add_script(ps_script)
-                    ps.begin_invoke()
-                    log.info(f"Executing command in {mode} mode: {command}")
+                        
+                        ps = PowerShell(r_pool)
+                        ps.add_script(ps_script)
+                        ps.begin_invoke()
+                        log.info(f"Executing command in {mode} mode: {command}")
                     
                     cursor = 0
                     while ps.state == PSInvocationState.RUNNING:
@@ -1019,15 +1033,18 @@ def interactive_shell(r_pool: RunspacePool) -> None:
                 continue
             elif command_lower == "interactive":
                 log.info("Entering interactive mode.")
-                global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD
+                global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD, GLOBAL_AUTH_METHOD
                 
-                # Check if we have credentials
-                if not GLOBAL_USERNAME or not GLOBAL_PASSWORD:
+                # Check if we have credentials (username + password) or Kerberos auth
+                if GLOBAL_AUTH_METHOD == "kerberos":
+                    print(GREEN + "[+] Entering interactive logon mode with Kerberos authentication." + RESET)
+                    print(GREEN + "[+] This session will use Kerberos credentials from the ticket cache." + RESET)
+                    interactive_mode_shell(r_pool, use_netonly=False)
+                elif not GLOBAL_USERNAME or not GLOBAL_PASSWORD:
                     print(RED + "[-] No credentials available for interactive mode." + RESET)
                     continue
-                
                 # Check if we have plaintext password
-                if GLOBAL_PLAINTEXT_PASSWORD:
+                elif GLOBAL_PLAINTEXT_PASSWORD:
                     print(GREEN + "[+] Entering interactive logon mode with plaintext credentials." + RESET)
                     print(GREEN + "[+] This session will have interactive logon type with full permissions." + RESET)
                     interactive_mode_shell(r_pool, use_netonly=False)
@@ -1378,9 +1395,10 @@ def main():
                 args.password = None
 
         # Store credentials in global variables for interactive mode
-        global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD
+        global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD, GLOBAL_AUTH_METHOD
         GLOBAL_USERNAME = args.user
         GLOBAL_PASSWORD = args.password
+        GLOBAL_AUTH_METHOD = auth
         # Check if we have a plaintext password (not a hash)
         if args.password and not args.hash:
             GLOBAL_PLAINTEXT_PASSWORD = args.password

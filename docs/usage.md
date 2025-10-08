@@ -153,7 +153,7 @@ Menu:
 [+] download <remote_path> <local_path>                     - Download a file
 [+] loadps <local_path>.ps1                                 - Load PowerShell functions from a local script
 [+] runps <local_path>.ps1                                  - Run a local PowerShell script on the remote host
-[+] interactive                                             - Enter interactive logon mode (requires plaintext password)
+[+] interactive                                             - Enter interactive logon mode
 [+] menu                                                    - Show this menu
 [+] clear, cls                                              - Clear the screen
 [+] exit                                                    - Exit the shell
@@ -246,6 +246,26 @@ evil-winrm-py PS-netonly C:\Users\john\Documents> qwinsta
 evil-winrm-py PS-netonly C:\Users\john\Documents> ([ADSI]"").distinguishedName
 # This may fail with authentication errors
 evil-winrm-py PS-netonly C:\Users\john\Documents> exit
+evil-winrm-py PS C:\Users\john\Documents>
+```
+
+#### With Kerberos Authentication
+
+When you authenticate using Kerberos (using `-k` flag), the interactive mode will use the Kerberos credentials from the ticket cache (TGT or TGS). This works with both password-based Kerberos authentication and ticket-based authentication (using `KRB5CCNAME`):
+
+```bash
+$ export KRB5CCNAME=/path/to/krb5cc_file
+$ evil-winrm-py -i dc01.example.com --kerberos
+evil-winrm-py PS C:\Users\john\Documents> interactive
+[+] Entering interactive logon mode with Kerberos authentication.
+[+] This session will use Kerberos credentials from the ticket cache.
+evil-winrm-py PS-kerberos C:\Users\john\Documents> qwinsta
+ SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE
+ services                                    0  Disc
+>console           john                      1  Active
+evil-winrm-py PS-kerberos C:\Users\john\Documents> ([ADSI]"").distinguishedName
+DC=example,DC=com
+evil-winrm-py PS-kerberos C:\Users\john\Documents> exit
 evil-winrm-py PS C:\Users\john\Documents>
 ```
 
