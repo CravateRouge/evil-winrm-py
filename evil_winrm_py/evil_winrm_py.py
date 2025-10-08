@@ -1156,8 +1156,8 @@ def interactive_shell(r_pool: RunspacePool) -> None:
                     print(GREEN + "[+] This session will have interactive logon type with full permissions." + RESET)
                     interactive_mode_shell(r_pool, use_netonly=False)
                 else:
-                    print(YELLOW + "[!] Plaintext password not provided, using netonly mode." + RESET)
-                    print(YELLOW + "[!] Network operations requiring real credentials (like LDAP) may fail." + RESET)
+                    print(YELLOW + "[!] Plaintext password not provided, using netonly mode with CreateProcessWithLogonW." + RESET)
+                    print(YELLOW + "[!] Using LOGON_NETCREDENTIALS_ONLY flag with dummy credentials for process creation." + RESET)
                     interactive_mode_shell(r_pool, use_netonly=True)
                 continue
             elif command_lower.startswith("download"):
