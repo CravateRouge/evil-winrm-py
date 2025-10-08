@@ -920,15 +920,20 @@ def interactive_mode_shell(r_pool: RunspacePool, use_netonly: bool = False) -> N
                     # Escape single quotes in the command for PowerShell
                     escaped_command = command.replace("'", "''")
                     
-                    # Determine which password to use
+                    # Determine which password to use and escape single quotes
                     password_to_use = GLOBAL_PLAINTEXT_PASSWORD if not use_netonly else GLOBAL_PASSWORD
+                    if not password_to_use:
+                        print(RED + "[-] No password available for interactive mode." + RESET)
+                        continue
+                    escaped_password = password_to_use.replace("'", "''")
+                    escaped_username = GLOBAL_USERNAME.replace("'", "''")
                     
                     # Build the PowerShell script to execute command with interactive logon
                     # Using Start-Process with -Credential creates a new process with CreateProcessWithLogonW
                     # which provides interactive logon type (LOGON_WITH_PROFILE)
                     ps_script = f"""
-$password = ConvertTo-SecureString '{password_to_use}' -AsPlainText -Force
-$cred = New-Object System.Management.Automation.PSCredential('{GLOBAL_USERNAME}', $password)
+$password = ConvertTo-SecureString '{escaped_password}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('{escaped_username}', $password)
 Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', '{escaped_command}' -Credential $cred -NoNewWindow -Wait -RedirectStandardOutput $env:TEMP\\out.txt -RedirectStandardError $env:TEMP\\err.txt
 Get-Content $env:TEMP\\out.txt -ErrorAction SilentlyContinue
 Get-Content $env:TEMP\\err.txt -ErrorAction SilentlyContinue | Write-Error
