@@ -934,18 +934,125 @@ def interactive_mode_shell(r_pool: RunspacePool, use_netonly: bool = False) -> N
                         # Escape single quotes in the command for PowerShell
                         escaped_command = command.replace("'", "''")
                         
-                        # Determine which password to use and escape single quotes
-                        password_to_use = GLOBAL_PLAINTEXT_PASSWORD if not use_netonly else GLOBAL_PASSWORD
-                        if not password_to_use:
-                            print(RED + "[-] No password available for interactive mode." + RESET)
-                            continue
-                        escaped_password = password_to_use.replace("'", "''")
-                        escaped_username = GLOBAL_USERNAME.replace("'", "''")
-                        
-                        # Build the PowerShell script to execute command with interactive logon
-                        # Using Start-Process with -Credential creates a new process with CreateProcessWithLogonW
-                        # which provides interactive logon type (LOGON_WITH_PROFILE)
-                        ps_script = f"""
+                        if use_netonly:
+                            # Use CreateProcessWithLogonW with LOGON_NETCREDENTIALS_ONLY flag and dummy credentials
+                            # This is required when using hash/certificate/non-plaintext authentication
+                            ps_script = f"""
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class ProcessCreator {{
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CreateProcessWithLogonW(
+        string lpUsername,
+        string lpDomain,
+        string lpPassword,
+        int dwLogonFlags,
+        string lpApplicationName,
+        string lpCommandLine,
+        int dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO {{
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }}
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {{
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }}
+
+    public const int LOGON_NETCREDENTIALS_ONLY = 2;
+    public const int CREATE_NO_WINDOW = 0x08000000;
+    public const uint INFINITE = 0xFFFFFFFF;
+}}
+"@
+
+$startupInfo = New-Object ProcessCreator+STARTUPINFO
+$startupInfo.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($startupInfo)
+$processInfo = New-Object ProcessCreator+PROCESS_INFORMATION
+
+# Build command with output redirection
+$commandLine = "powershell.exe -NoProfile -Command `"{escaped_command} > $env:TEMP\\out.txt 2> $env:TEMP\\err.txt`""
+
+# Create process with LOGON_NETCREDENTIALS_ONLY flag and dummy credentials
+$success = [ProcessCreator]::CreateProcessWithLogonW(
+    "x",
+    $null,
+    "x",
+    [ProcessCreator]::LOGON_NETCREDENTIALS_ONLY,
+    $null,
+    $commandLine,
+    [ProcessCreator]::CREATE_NO_WINDOW,
+    [IntPtr]::Zero,
+    $null,
+    [ref]$startupInfo,
+    [ref]$processInfo
+)
+
+if ($success) {{
+    # Wait for process to complete
+    [ProcessCreator]::WaitForSingleObject($processInfo.hProcess, [ProcessCreator]::INFINITE) | Out-Null
+    
+    # Close handles
+    [ProcessCreator]::CloseHandle($processInfo.hProcess) | Out-Null
+    [ProcessCreator]::CloseHandle($processInfo.hThread) | Out-Null
+    
+    # Read and display output
+    Get-Content $env:TEMP\\out.txt -ErrorAction SilentlyContinue
+    Get-Content $env:TEMP\\err.txt -ErrorAction SilentlyContinue | Write-Error
+}} else {{
+    $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    Write-Error "Failed to create process. Error code: $errorCode"
+}}
+
+# Clean up
+Remove-Item $env:TEMP\\out.txt -ErrorAction SilentlyContinue
+Remove-Item $env:TEMP\\err.txt -ErrorAction SilentlyContinue
+"""
+                        else:
+                            # Use Start-Process with plaintext credentials
+                            # This provides interactive logon type (LOGON_WITH_PROFILE)
+                            if not GLOBAL_PLAINTEXT_PASSWORD:
+                                print(RED + "[-] No plaintext password available for interactive mode." + RESET)
+                                continue
+                            escaped_password = GLOBAL_PLAINTEXT_PASSWORD.replace("'", "''")
+                            escaped_username = GLOBAL_USERNAME.replace("'", "''")
+                            
+                            ps_script = f"""
 $password = ConvertTo-SecureString '{escaped_password}' -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential('{escaped_username}', $password)
 Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', '{escaped_command}' -Credential $cred -NoNewWindow -Wait -RedirectStandardOutput $env:TEMP\\out.txt -RedirectStandardError $env:TEMP\\err.txt
