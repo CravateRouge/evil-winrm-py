@@ -157,7 +157,7 @@ Menu:
 [+] download <remote_path> <local_path>                     - Download a file
 [+] loadps <local_path>.ps1                                 - Load PowerShell functions from a local script
 [+] runps <local_path>.ps1                                  - Run a local PowerShell script on the remote host
-[+] interactive                                             - Enter interactive logon mode (requires plaintext password)
+[+] interactive                                             - Enter interactive logon mode
 [+] menu                                                    - Show this menu
 [+] clear, cls                                              - Clear the screen
 [+] exit                                                    - Exit the shell
