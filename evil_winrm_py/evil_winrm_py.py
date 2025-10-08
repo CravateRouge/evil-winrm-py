@@ -63,11 +63,17 @@ MENU_COMMANDS = [
     "download",
     "loadps",
     "runps",
+    "interactive",
     "menu",
     "clear",
     "exit",
 ]
 COMMAND_SUGGESTIONS = []
+
+# --- Global Variables for Credentials ---
+GLOBAL_USERNAME = None
+GLOBAL_PASSWORD = None
+GLOBAL_PLAINTEXT_PASSWORD = None
 
 # --- Colors ---
 # ANSI escape codes for colored output
@@ -123,12 +129,19 @@ def run_ps_cmd(r_pool: RunspacePool, command: str) -> tuple[str, list, bool]:
     return "\n".join(ps.output), ps.streams, ps.had_errors
 
 
-def get_prompt(r_pool: RunspacePool) -> str:
-    """Returns the prompt string for the interactive shell."""
+def get_prompt(r_pool: RunspacePool, mode: str = None) -> str:
+    """Returns the prompt string for the interactive shell.
+    
+    Args:
+        r_pool: The PowerShell runspace pool
+        mode: Optional mode string to display ('interactive' or 'netonly')
+    """
     output, streams, had_errors = run_ps_cmd(
         r_pool, "$pwd.Path"
     )  # Get current working directory
     if not had_errors:
+        if mode:
+            return f"{RED}evil-winrm-py{RESET} {YELLOW}{BOLD}PS-{mode}{RESET} {output}> "
         return f"{RED}evil-winrm-py{RESET} {YELLOW}{BOLD}PS{RESET} {output}> "
     return "PS ?> "  # Fallback prompt
 
@@ -142,6 +155,7 @@ def show_menu() -> None:
         ("download <remote_path> <local_path>", "Download a file"),
         ("loadps <local_path>.ps1", "Load PowerShell functions from a local script"),
         ("runps <local_path>.ps1", "Run a local PowerShell script on the remote host"),
+        ("interactive", "Enter interactive logon mode (requires plaintext password)"),
         ("menu", "Show this menu"),
         ("clear, cls", "Clear the screen"),
         ("exit", "Exit the shell"),
@@ -853,6 +867,108 @@ def run_ps(r_pool: RunspacePool, local_path: str) -> None:
             ps.stop()
 
 
+def interactive_mode_shell(r_pool: RunspacePool, use_netonly: bool = False) -> None:
+    """Runs an interactive mode shell with CreateProcessWithLogonW style execution.
+    
+    Args:
+        r_pool: The PowerShell runspace pool
+        use_netonly: If True, use LOGON_NETCREDENTIALS_ONLY (network credentials only).
+                     If False, use interactive logon with full credentials.
+    """
+    global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD
+    
+    mode = "netonly" if use_netonly else "interactive"
+    log.info(f"Starting {mode} mode shell...")
+    
+    # Set up history file
+    if not HISTORY_FILE.exists():
+        Path(HISTORY_FILE).touch()
+    prompt_history = FileHistory(HISTORY_FILE)
+    prompt_session = PromptSession(history=prompt_history)
+    
+    # Set up command completer
+    completer = CommandPathCompleter(r_pool)
+    
+    while True:
+        try:
+            try:
+                prompt_text = ANSI(get_prompt(r_pool, mode))
+            except (KeyboardInterrupt, EOFError):
+                return
+            command = prompt_session.prompt(
+                prompt_text,
+                completer=completer,
+                complete_while_typing=False,
+            )
+            
+            if not command:
+                continue
+            
+            # Normalize command input
+            command_lower = str(command).strip().lower()
+            
+            # Check for exit command
+            if command_lower == "exit":
+                log.info(f"Exiting {mode} mode shell.")
+                return
+            elif command_lower in ["clear", "cls"]:
+                log.info("Clearing the screen.")
+                clear()
+                continue
+            else:
+                try:
+                    # Escape single quotes in the command for PowerShell
+                    escaped_command = command.replace("'", "''")
+                    
+                    # Determine which password to use
+                    password_to_use = GLOBAL_PLAINTEXT_PASSWORD if not use_netonly else GLOBAL_PASSWORD
+                    
+                    # Build the PowerShell script to execute command with interactive logon
+                    # Using Start-Process with -Credential creates a new process with CreateProcessWithLogonW
+                    # which provides interactive logon type (LOGON_WITH_PROFILE)
+                    ps_script = f"""
+$password = ConvertTo-SecureString '{password_to_use}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('{GLOBAL_USERNAME}', $password)
+Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', '{escaped_command}' -Credential $cred -NoNewWindow -Wait -RedirectStandardOutput $env:TEMP\\out.txt -RedirectStandardError $env:TEMP\\err.txt
+Get-Content $env:TEMP\\out.txt -ErrorAction SilentlyContinue
+Get-Content $env:TEMP\\err.txt -ErrorAction SilentlyContinue | Write-Error
+Remove-Item $env:TEMP\\out.txt -ErrorAction SilentlyContinue
+Remove-Item $env:TEMP\\err.txt -ErrorAction SilentlyContinue
+"""
+                    
+                    ps = PowerShell(r_pool)
+                    ps.add_script(ps_script)
+                    ps.begin_invoke()
+                    log.info(f"Executing command in {mode} mode: {command}")
+                    
+                    cursor = 0
+                    while ps.state == PSInvocationState.RUNNING:
+                        with DelayedKeyboardInterrupt():
+                            ps.poll_invoke()
+                        output = ps.output
+                        for line in output[cursor:]:
+                            print(line)
+                        cursor = len(output)
+                    
+                    log.info("Command execution completed.")
+                    
+                    if ps.streams.error:
+                        for error in ps.streams.error:
+                            print(RED + error._to_string + RESET)
+                            log.error("Error: {}".format(error._to_string))
+                            log.error("\tCategoryInfo: {}".format(error.message))
+                            log.error("\tFullyQualifiedErrorId: {}".format(error.fq_error))
+                except KeyboardInterrupt:
+                    if ps.state == PSInvocationState.RUNNING:
+                        log.info("Stopping command execution.")
+                        ps.stop()
+        except KeyboardInterrupt:
+            print("\nCaught Ctrl+C. Type 'exit' to return to normal shell.")
+            continue
+        except EOFError:
+            return
+
+
 def interactive_shell(r_pool: RunspacePool) -> None:
     """Runs the interactive pseudo-shell."""
     log.info("Starting interactive PowerShell session...")
@@ -895,6 +1011,25 @@ def interactive_shell(r_pool: RunspacePool) -> None:
             elif command_lower == "menu":
                 log.info("Displaying menu.")
                 show_menu()
+                continue
+            elif command_lower == "interactive":
+                log.info("Entering interactive mode.")
+                global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD
+                
+                # Check if we have credentials
+                if not GLOBAL_USERNAME or not GLOBAL_PASSWORD:
+                    print(RED + "[-] No credentials available for interactive mode." + RESET)
+                    continue
+                
+                # Check if we have plaintext password
+                if GLOBAL_PLAINTEXT_PASSWORD:
+                    print(GREEN + "[+] Entering interactive logon mode with plaintext credentials." + RESET)
+                    print(GREEN + "[+] This session will have interactive logon type with full permissions." + RESET)
+                    interactive_mode_shell(r_pool, use_netonly=False)
+                else:
+                    print(YELLOW + "[!] Plaintext password not provided, using netonly mode." + RESET)
+                    print(YELLOW + "[!] Network operations requiring real credentials (like LDAP) may fail." + RESET)
+                    interactive_mode_shell(r_pool, use_netonly=True)
                 continue
             elif command_lower.startswith("download"):
                 command_parts = quoted_command_split(command)
@@ -1237,6 +1372,14 @@ def main():
             if not args.password:
                 args.password = None
 
+        # Store credentials in global variables for interactive mode
+        global GLOBAL_USERNAME, GLOBAL_PASSWORD, GLOBAL_PLAINTEXT_PASSWORD
+        GLOBAL_USERNAME = args.user
+        GLOBAL_PASSWORD = args.password
+        # Check if we have a plaintext password (not a hash)
+        if args.password and not args.hash:
+            GLOBAL_PLAINTEXT_PASSWORD = args.password
+        
         if username:
             log.info(
                 "[*] Connecting to '{}:{}' as '{}'"
