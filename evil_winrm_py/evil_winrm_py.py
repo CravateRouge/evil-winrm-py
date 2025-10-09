@@ -578,6 +578,40 @@ class NetOnlyRunspacePool:
     - The nested process runs netonly_listener.ps1 which creates a named pipe server
     - Commands are sent via netonly_execute.ps1 which acts as a named pipe client
     - Output and error streams are captured and returned as JSON
+    
+    Example Usage:
+    
+        # Create a NetOnlyRunspacePool with alternate credentials
+        netonly_pool = NetOnlyRunspacePool(
+            parent_pool=r_pool,
+            username="DOMAIN\\user",
+            password="password123",
+            logon_type="netonly"  # or "interactive"
+        )
+        
+        # Execute a single command in the nested process
+        output, errors, had_errors = netonly_pool.execute_command("whoami /all")
+        for line in output:
+            print(line)
+        
+        # Execute a script in the nested process
+        script = '''
+        $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        Write-Output "Running as: $user"
+        Get-Process | Select-Object -First 5
+        '''
+        output, errors, had_errors = netonly_pool.execute_script(script)
+        
+        # Run a local PowerShell script file in the nested process
+        # (automatically routed when using run_ps with NetOnlyRunspacePool)
+        run_ps(netonly_pool, "/path/to/script.ps1")
+        
+        # Clean up when done
+        netonly_pool.cleanup()
+    
+    Note: The NetOnlyRunspacePool is automatically used when entering interactive
+    mode with the 'interactive' command in the evil-winrm-py shell. Commands and
+    scripts are transparently routed to the nested process.
     """
     
     def __init__(self, parent_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None, logon_type: str = "netonly"):
