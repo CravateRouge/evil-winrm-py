@@ -545,8 +545,24 @@ class NetOnlyShellWrapper:
     to execute in the context of alternate credentials.
     
     This wrapper implements the same interface as WinRS shell and can be used
-    by PowerShell objects. It delegates all operations to the parent shell while
-    maintaining the ability to intercept and redirect commands in the future.
+    by PowerShell objects. It currently delegates all operations to the parent shell.
+    
+    IMPLEMENTATION NOTE:
+    Full command redirection to execute with alternate credentials would require:
+    1. Intercepting and deserializing PSRP protocol messages in send()
+    2. Extracting PowerShell commands from the messages
+    3. Wrapping them with Invoke-Command or Start-Job -Credential
+    4. Reserializing and sending the wrapped commands
+    5. Handling the responses appropriately in receive()
+    
+    Alternative approaches could include:
+    - Creating a persistent PSSession and routing all commands through it
+    - Using a named pipe or other IPC mechanism with a PowerShell process
+      created by CreateProcessWithLogonW with redirected I/O
+    - Modifying the RunspacePool creation to use alternate credentials directly
+    
+    The current implementation provides the shell property infrastructure that
+    PowerShell objects expect, enabling future enhancement of command redirection.
     """
     
     def __init__(self, parent_shell, parent_pool: RunspacePool, username: Optional[str] = None, 
@@ -571,11 +587,21 @@ class NetOnlyShellWrapper:
         """
         Send data through the shell.
         
-        This method intercepts send calls and can be used to redirect commands
-        to execute in the alternate credentials context. Currently delegates to
-        the parent shell.
+        This method intercepts send calls. When credentials are available, it wraps
+        PowerShell commands to execute in the alternate credentials context.
+        
+        Note: Full PSRP message interception and wrapping is complex. This is a
+        placeholder for future enhancement. For now, it delegates to the parent shell.
         """
         log.debug(f"NetOnlyShellWrapper.send: stream={stream}, command_id={command_id}, data_len={len(data) if data else 0}")
+        
+        # TODO: Implement PSRP message interception and command wrapping
+        # This would involve:
+        # 1. Deserializing the PSRP message from data
+        # 2. Extracting the PowerShell command
+        # 3. Wrapping it with Invoke-Command or Start-Job -Credential
+        # 4. Reserializing and sending the wrapped command
+        
         return self.parent_shell.send(stream, data, command_id, end)
     
     def receive(self, stream: str = 'stdout stderr', command_id: Optional[str] = None, timeout: Optional[int] = None):
@@ -641,11 +667,11 @@ class NetOnlyRunspacePool:
         """
         Initialize the shell wrapper for command redirection.
         
-        Creates a shell wrapper that will eventually redirect commands to execute
-        in the context of alternate credentials. For now, it ensures the shell
-        property is properly set and accessible.
+        Creates a shell wrapper that ensures PowerShell objects can properly
+        access the shell property. The wrapper delegates to the parent shell
+        while maintaining the infrastructure for future command redirection.
         """
-        log.info(f"Initializing shell wrapper for credential context (logon_type={self.logon_type})...")
+        log.info(f"Initializing NetOnlyRunspacePool shell wrapper (logon_type={self.logon_type})...")
         
         # Always create the shell wrapper, even without username/password
         # This ensures PowerShell(NetOnlyRunspacePool) objects can access the shell property
@@ -656,7 +682,15 @@ class NetOnlyRunspacePool:
             password=self.password,
             logon_type=self.logon_type
         )
-        log.info("Shell wrapper created and ready for command execution")
+        
+        if self.username and self.password:
+            log.info(f"Shell wrapper created with credentials for {self.username} ({self.logon_type} mode)")
+            print(GREEN + f"[+] NetOnly shell wrapper active for {self.username} ({self.logon_type} mode)" + RESET)
+            print(YELLOW + "[*] Note: Commands currently execute in parent session context." + RESET)
+            print(YELLOW + "[*] Full credential context redirection requires PSRP message interception." + RESET)
+        else:
+            log.info("Shell wrapper created without alternate credentials")
+            print(YELLOW + "[*] NetOnly shell wrapper active (no alternate credentials provided)" + RESET)
     
     @property
     def connection(self):
