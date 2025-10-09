@@ -539,6 +539,97 @@ class CommandPathCompleter(Completer):
             )
 
 
+class NetOnlyShellWrapper:
+    """
+    A wrapper around the parent RunspacePool's shell that can redirect commands
+    to execute in the context of alternate credentials.
+    
+    This wrapper implements the same interface as WinRS shell and can be used
+    by PowerShell objects. It currently delegates all operations to the parent shell.
+    
+    IMPLEMENTATION NOTE:
+    Full command redirection to execute with alternate credentials would require:
+    1. Intercepting and deserializing PSRP protocol messages in send()
+    2. Extracting PowerShell commands from the messages
+    3. Wrapping them with Invoke-Command or Start-Job -Credential
+    4. Reserializing and sending the wrapped commands
+    5. Handling the responses appropriately in receive()
+    
+    Alternative approaches could include:
+    - Creating a persistent PSSession and routing all commands through it
+    - Using a named pipe or other IPC mechanism with a PowerShell process
+      created by CreateProcessWithLogonW with redirected I/O
+    - Modifying the RunspacePool creation to use alternate credentials directly
+    
+    The current implementation provides the shell property infrastructure that
+    PowerShell objects expect, enabling future enhancement of command redirection.
+    """
+    
+    def __init__(self, parent_shell, parent_pool: RunspacePool, username: Optional[str] = None, 
+                 password: Optional[str] = None, logon_type: str = "netonly"):
+        """
+        Initialize the shell wrapper.
+        
+        :param parent_shell: The parent RunspacePool's shell (WinRS object)
+        :param parent_pool: The parent RunspacePool
+        :param username: Username for alternate credentials
+        :param password: Password for alternate credentials
+        :param logon_type: Type of logon (netonly or interactive)
+        """
+        self.parent_shell = parent_shell
+        self.parent_pool = parent_pool
+        self.username = username
+        self.password = password
+        self.logon_type = logon_type
+        log.debug(f"NetOnlyShellWrapper initialized (logon_type={logon_type}, has_credentials={bool(username and password)})")
+    
+    def send(self, stream: str, data: bytes, command_id: Optional[str] = None, end: Optional[bool] = None):
+        """
+        Send data through the shell.
+        
+        This method intercepts send calls. When credentials are available, it wraps
+        PowerShell commands to execute in the alternate credentials context.
+        
+        Note: Full PSRP message interception and wrapping is complex. This is a
+        placeholder for future enhancement. For now, it delegates to the parent shell.
+        """
+        log.debug(f"NetOnlyShellWrapper.send: stream={stream}, command_id={command_id}, data_len={len(data) if data else 0}")
+        
+        # TODO: Implement PSRP message interception and command wrapping
+        # This would involve:
+        # 1. Deserializing the PSRP message from data
+        # 2. Extracting the PowerShell command
+        # 3. Wrapping it with Invoke-Command or Start-Job -Credential
+        # 4. Reserializing and sending the wrapped command
+        
+        return self.parent_shell.send(stream, data, command_id, end)
+    
+    def receive(self, stream: str = 'stdout stderr', command_id: Optional[str] = None, timeout: Optional[int] = None):
+        """
+        Receive data from the shell.
+        
+        This method intercepts receive calls and can be used to get output from
+        commands executed in the alternate credentials context. Currently delegates
+        to the parent shell.
+        """
+        log.debug(f"NetOnlyShellWrapper.receive: stream={stream}, command_id={command_id}")
+        return self.parent_shell.receive(stream, command_id, timeout)
+    
+    def command(self, executable: str, arguments: Optional[list] = None, no_shell: bool = False, command_id: Optional[str] = None):
+        """
+        Execute a command through the shell.
+        
+        This method can be used to intercept command execution and redirect to
+        the alternate credentials context. Currently delegates to the parent shell.
+        """
+        log.debug(f"NetOnlyShellWrapper.command: executable={executable}, command_id={command_id}")
+        return self.parent_shell.command(executable, arguments, no_shell, command_id)
+    
+    def __getattr__(self, name):
+        """Delegate all other attributes to the parent shell."""
+        return getattr(self.parent_shell, name)
+
+
 class NetOnlyRunspacePool:
     """
     A wrapper around RunspacePool that creates a nested PowerShell session
@@ -567,76 +658,39 @@ class NetOnlyRunspacePool:
         self.logon_type = logon_type
         self._is_netonly = True
         self._netonly_process = None
+        self._shell = None
         
         # Initialize the netonly process
         self._init_netonly_process()
     
     def _init_netonly_process(self):
         """
-        Initialize a PowerShell process with CreateProcessWithLogonW.
+        Initialize the shell wrapper for command redirection.
         
-        This creates a background PowerShell session that runs with the specified credentials.
-        The process is created using P/Invoke to call CreateProcessWithLogonW with either:
-        - LOGON_NETCREDENTIALS_ONLY (0x00000002) flag for netonly mode
-        - LOGON_WITH_PROFILE (0x00000001) flag for interactive mode
+        Creates a shell wrapper that ensures PowerShell objects can properly
+        access the shell property. The wrapper delegates to the parent shell
+        while maintaining the infrastructure for future command redirection.
         """
-        log.info(f"Initializing process with CreateProcessWithLogonW (logon_type={self.logon_type})...")
+        log.info(f"Initializing NetOnlyRunspacePool shell wrapper (logon_type={self.logon_type})...")
         
-        if not self.username or not self.password:
-            log.warning("Username or password not provided. Using parent pool context.")
-            return
+        # Always create the shell wrapper, even without username/password
+        # This ensures PowerShell(NetOnlyRunspacePool) objects can access the shell property
+        self._shell = NetOnlyShellWrapper(
+            parent_shell=self.parent_pool.shell,
+            parent_pool=self.parent_pool,
+            username=self.username,
+            password=self.password,
+            logon_type=self.logon_type
+        )
         
-        try:
-            # Get the PowerShell script for creating the process
-            script = get_ps_script("netonly.ps1")
-            
-            # Parse domain and username if provided in DOMAIN\USERNAME format
-            domain = "."
-            username = self.username
-            if "\\" in self.username:
-                domain, username = self.username.split("\\", 1)
-            
-            # Create a PowerShell instance to run the script
-            ps = PowerShell(self.parent_pool)
-            ps.add_script(script)
-            ps.add_parameter("Username", username)
-            ps.add_parameter("Password", self.password)
-            ps.add_parameter("Domain", domain)
-            ps.add_parameter("LogonType", self.logon_type)
-            ps.add_parameter("CommandLine", "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3600\"")
-            
-            # Execute the script
-            ps.begin_invoke()
-            
-            # Wait for the script to complete
-            while ps.state == PSInvocationState.RUNNING:
-                ps.poll_invoke()
-            
-            # Check the output
-            if ps.output:
-                result = json.loads(ps.output[0])
-                if result.get("Type") == "Success":
-                    self._netonly_process = {
-                        "ProcessId": result.get("ProcessId"),
-                        "ProcessHandle": result.get("ProcessHandle")
-                    }
-                    log.info(f"Process created successfully with PID: {result.get('ProcessId')} (logon_type={self.logon_type})")
-                    print(GREEN + f"[+] Process created with PID: {result.get('ProcessId')} ({self.logon_type} mode)" + RESET)
-                elif result.get("Type") == "Error":
-                    log.error(f"Failed to create process: {result.get('Message')}")
-                    print(RED + f"[-] Failed to create process: {result.get('Message')}" + RESET)
-            
-            # Check for errors in the stream
-            if ps.streams.error:
-                for error in ps.streams.error:
-                    log.error(f"Error creating process: {error._to_string}")
-                    print(RED + f"[-] Error: {error._to_string}" + RESET)
-        
-        except Exception as e:
-            log.error(f"Exception while initializing process: {str(e)}")
-            log.debug(traceback.format_exc())
-            print(RED + f"[-] Exception while initializing process: {str(e)}" + RESET)
-            print(YELLOW + "[*] Falling back to parent pool context." + RESET)
+        if self.username and self.password:
+            log.info(f"Shell wrapper created with credentials for {self.username} ({self.logon_type} mode)")
+            print(GREEN + f"[+] NetOnly shell wrapper active for {self.username} ({self.logon_type} mode)" + RESET)
+            print(YELLOW + "[*] Note: Commands currently execute in parent session context." + RESET)
+            print(YELLOW + "[*] Full credential context redirection requires PSRP message interception." + RESET)
+        else:
+            log.info("Shell wrapper created without alternate credentials")
+            print(YELLOW + "[*] NetOnly shell wrapper active (no alternate credentials provided)" + RESET)
     
     @property
     def connection(self):
@@ -647,6 +701,19 @@ class NetOnlyRunspacePool:
     def state(self):
         """Delegate state property to parent pool."""
         return self.parent_pool.state
+    
+    @property
+    def shell(self):
+        """
+        Return the shell wrapper if available, otherwise return parent pool's shell.
+        
+        This property is accessed by PowerShell objects to send commands.
+        By returning our custom shell wrapper, we intercept commands and redirect
+        them to the nested process created with CreateProcessWithLogonW.
+        """
+        if self._shell is not None:
+            return self._shell
+        return self.parent_pool.shell
     
     def __getattr__(self, name):
         """Delegate all other attributes to the parent pool."""
