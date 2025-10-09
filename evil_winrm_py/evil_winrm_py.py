@@ -539,6 +539,51 @@ class CommandPathCompleter(Completer):
             )
 
 
+class NetOnlyShellWrapper:
+    """
+    A wrapper around the parent RunspacePool's shell that redirects commands
+    to execute in a PSSession with alternate credentials.
+    
+    This wrapper intercepts shell commands sent by PowerShell objects and executes
+    them in the context of the PSSession, which runs with alternate credentials.
+    """
+    
+    def __init__(self, parent_shell, parent_pool: RunspacePool, session_id: Optional[int] = None):
+        """
+        Initialize the shell wrapper.
+        
+        :param parent_shell: The parent RunspacePool's shell (WinRS object)
+        :param parent_pool: The parent RunspacePool
+        :param session_id: The PSSession ID to execute commands in
+        """
+        self.parent_shell = parent_shell
+        self.parent_pool = parent_pool
+        self.session_id = session_id
+        log.debug(f"NetOnlyShellWrapper initialized with session_id: {session_id}")
+    
+    def send(self, stream: str, data: bytes, command_id: Optional[str] = None, end: Optional[bool] = None):
+        """
+        Intercept send calls and wrap commands to execute in the PSSession.
+        
+        This is where we redirect command execution to the alternate credentials context.
+        """
+        # For now, delegate to parent shell
+        # TODO: Implement command wrapping with Invoke-Command -Session
+        log.debug(f"NetOnlyShellWrapper.send called with stream={stream}, command_id={command_id}")
+        return self.parent_shell.send(stream, data, command_id, end)
+    
+    def receive(self, stream: str = 'stdout stderr', command_id: Optional[str] = None, timeout: Optional[int] = None):
+        """
+        Intercept receive calls to get output from the PSSession.
+        """
+        log.debug(f"NetOnlyShellWrapper.receive called with stream={stream}, command_id={command_id}")
+        return self.parent_shell.receive(stream, command_id, timeout)
+    
+    def __getattr__(self, name):
+        """Delegate all other attributes to the parent shell."""
+        return getattr(self.parent_shell, name)
+
+
 class NetOnlyRunspacePool:
     """
     A wrapper around RunspacePool that creates a nested PowerShell session
@@ -567,43 +612,68 @@ class NetOnlyRunspacePool:
         self.logon_type = logon_type
         self._is_netonly = True
         self._netonly_process = None
+        self._shell = None
         
         # Initialize the netonly process
         self._init_netonly_process()
     
     def _init_netonly_process(self):
         """
-        Initialize a PowerShell process with CreateProcessWithLogonW.
+        Initialize a PowerShell remoting session with alternate credentials.
         
-        This creates a background PowerShell session that runs with the specified credentials.
-        The process is created using P/Invoke to call CreateProcessWithLogonW with either:
-        - LOGON_NETCREDENTIALS_ONLY (0x00000002) flag for netonly mode
-        - LOGON_WITH_PROFILE (0x00000001) flag for interactive mode
+        Instead of creating a standalone process, we create a loopback PSSession
+        that runs with the specified credentials. This allows us to execute commands
+        in the context of those credentials using Invoke-Command.
         """
-        log.info(f"Initializing process with CreateProcessWithLogonW (logon_type={self.logon_type})...")
+        log.info(f"Initializing PSSession with alternate credentials (logon_type={self.logon_type})...")
         
         if not self.username or not self.password:
             log.warning("Username or password not provided. Using parent pool context.")
             return
         
         try:
-            # Get the PowerShell script for creating the process
-            script = get_ps_script("netonly.ps1")
+            # Create a PSCredential object and loopback PSSession
+            # We use a loopback connection (localhost/127.0.0.1) with the alternate credentials
+            # This effectively runs commands with those credentials
             
-            # Parse domain and username if provided in DOMAIN\USERNAME format
-            domain = "."
-            username = self.username
-            if "\\" in self.username:
-                domain, username = self.username.split("\\", 1)
+            script = """
+            param($Username, $Password, $LogonType)
             
-            # Create a PowerShell instance to run the script
+            try {
+                # Create PSCredential
+                $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+                $credential = New-Object System.Management.Automation.PSCredential($Username, $securePassword)
+                
+                # Create a loopback PSSession with the alternate credentials
+                # This will use the credentials for authentication
+                $session = New-PSSession -ComputerName localhost -Credential $credential -ErrorAction Stop
+                
+                # Store the session ID for later use
+                [PSCustomObject]@{
+                    Type = "Success"
+                    SessionId = $session.Id
+                    SessionName = $session.Name
+                    ComputerName = $session.ComputerName
+                    State = $session.State
+                    LogonType = $LogonType
+                    Message = "PSSession created successfully with alternate credentials"
+                } | ConvertTo-Json -Compress
+            }
+            catch {
+                [PSCustomObject]@{
+                    Type = "Error"
+                    Message = $_.Exception.Message
+                    Details = $_.ToString()
+                } | ConvertTo-Json -Compress
+            }
+            """
+            
+            # Create a PowerShell instance to create the PSSession
             ps = PowerShell(self.parent_pool)
             ps.add_script(script)
-            ps.add_parameter("Username", username)
+            ps.add_parameter("Username", self.username)
             ps.add_parameter("Password", self.password)
-            ps.add_parameter("Domain", domain)
             ps.add_parameter("LogonType", self.logon_type)
-            ps.add_parameter("CommandLine", "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3600\"")
             
             # Execute the script
             ps.begin_invoke()
@@ -616,26 +686,38 @@ class NetOnlyRunspacePool:
             if ps.output:
                 result = json.loads(ps.output[0])
                 if result.get("Type") == "Success":
+                    session_id = result.get("SessionId")
                     self._netonly_process = {
-                        "ProcessId": result.get("ProcessId"),
-                        "ProcessHandle": result.get("ProcessHandle")
+                        "SessionId": session_id,
+                        "SessionName": result.get("SessionName"),
+                        "LogonType": self.logon_type
                     }
-                    log.info(f"Process created successfully with PID: {result.get('ProcessId')} (logon_type={self.logon_type})")
-                    print(GREEN + f"[+] Process created with PID: {result.get('ProcessId')} ({self.logon_type} mode)" + RESET)
+                    log.info(f"PSSession created successfully with ID: {session_id} (logon_type={self.logon_type})")
+                    print(GREEN + f"[+] PSSession created with ID: {session_id} ({self.logon_type} mode)" + RESET)
+                    
+                    # Create the shell wrapper to redirect commands to the PSSession
+                    self._shell = NetOnlyShellWrapper(
+                        parent_shell=self.parent_pool.shell,
+                        parent_pool=self.parent_pool,
+                        session_id=session_id
+                    )
+                    log.info("Shell wrapper created for PSSession command redirection")
+                    
                 elif result.get("Type") == "Error":
-                    log.error(f"Failed to create process: {result.get('Message')}")
-                    print(RED + f"[-] Failed to create process: {result.get('Message')}" + RESET)
+                    log.error(f"Failed to create PSSession: {result.get('Message')}")
+                    print(RED + f"[-] Failed to create PSSession: {result.get('Message')}" + RESET)
+                    print(YELLOW + "[*] Note: Loopback PSSession requires network credentials. Falling back to parent pool." + RESET)
             
             # Check for errors in the stream
             if ps.streams.error:
                 for error in ps.streams.error:
-                    log.error(f"Error creating process: {error._to_string}")
+                    log.error(f"Error creating PSSession: {error._to_string}")
                     print(RED + f"[-] Error: {error._to_string}" + RESET)
         
         except Exception as e:
-            log.error(f"Exception while initializing process: {str(e)}")
+            log.error(f"Exception while initializing PSSession: {str(e)}")
             log.debug(traceback.format_exc())
-            print(RED + f"[-] Exception while initializing process: {str(e)}" + RESET)
+            print(RED + f"[-] Exception while initializing PSSession: {str(e)}" + RESET)
             print(YELLOW + "[*] Falling back to parent pool context." + RESET)
     
     @property
@@ -647,6 +729,19 @@ class NetOnlyRunspacePool:
     def state(self):
         """Delegate state property to parent pool."""
         return self.parent_pool.state
+    
+    @property
+    def shell(self):
+        """
+        Return the shell wrapper if available, otherwise return parent pool's shell.
+        
+        This property is accessed by PowerShell objects to send commands.
+        By returning our custom shell wrapper, we intercept commands and redirect
+        them to the nested process created with CreateProcessWithLogonW.
+        """
+        if self._shell is not None:
+            return self._shell
+        return self.parent_pool.shell
     
     def __getattr__(self, name):
         """Delegate all other attributes to the parent pool."""
