@@ -13,6 +13,10 @@ param (
     [string]$Domain = ".",
     
     [Parameter(Mandatory=$false)]
+    [ValidateSet("netonly", "interactive")]
+    [string]$LogonType = "netonly",
+    
+    [Parameter(Mandatory=$false)]
     [string]$CommandLine = "powershell.exe -NoExit -Command `"Write-Host 'NetOnly session started'`""
 )
 
@@ -101,8 +105,12 @@ try {
     # Initialize PROCESS_INFORMATION structure
     $processInfo = New-Object ProcessWithLogon+PROCESS_INFORMATION
     
-    # Set creation flags - LOGON_NETCREDENTIALS_ONLY is the key flag here
-    $logonFlags = [ProcessWithLogon]::LOGON_NETCREDENTIALS_ONLY
+    # Set creation flags based on LogonType parameter
+    if ($LogonType -eq "interactive") {
+        $logonFlags = [ProcessWithLogon]::LOGON_WITH_PROFILE
+    } else {
+        $logonFlags = [ProcessWithLogon]::LOGON_NETCREDENTIALS_ONLY
+    }
     $creationFlags = [ProcessWithLogon]::CREATE_NEW_CONSOLE
     
     # Call CreateProcessWithLogonW
@@ -122,13 +130,15 @@ try {
     
     if ($success) {
         # Return success information as JSON
+        $logonFlagName = if ($LogonType -eq "interactive") { "LOGON_WITH_PROFILE" } else { "LOGON_NETCREDENTIALS_ONLY" }
         [PSCustomObject]@{
             Type = "Success"
-            Message = "Process created successfully with LOGON_NETCREDENTIALS_ONLY"
+            Message = "Process created successfully with $logonFlagName"
             ProcessId = $processInfo.dwProcessId
             ThreadId = $processInfo.dwThreadId
             ProcessHandle = $processInfo.hProcess.ToInt64()
             ThreadHandle = $processInfo.hThread.ToInt64()
+            LogonType = $LogonType
         } | ConvertTo-Json -Compress | Write-Output
         
         # Clean up handles

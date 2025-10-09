@@ -542,27 +542,29 @@ class CommandPathCompleter(Completer):
 class NetOnlyRunspacePool:
     """
     A wrapper around RunspacePool that creates a nested PowerShell session
-    using CreateProcessWithLogonW with LOGON_NETCREDENTIALS_ONLY flag.
+    using CreateProcessWithLogonW with either LOGON_WITH_PROFILE or LOGON_NETCREDENTIALS_ONLY flag.
     
-    This allows running commands in a context that uses network-only credentials,
-    similar to 'runas /netonly'.
+    This allows running commands in a context that uses different credentials,
+    similar to 'runas /netonly' or interactive logon.
     
     The implementation creates a background PowerShell job on the remote host that
-    runs with network-only credentials. Commands are executed in this context
+    runs with the specified credentials. Commands are executed in this context
     by invoking them through the job.
     """
     
-    def __init__(self, parent_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None):
+    def __init__(self, parent_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None, logon_type: str = "netonly"):
         """
         Initialize the NetOnlyRunspacePool.
         
         :param parent_pool: The parent RunspacePool to use for creating the nested session
-        :param username: Username for the netonly credentials
-        :param password: Password for the netonly credentials
+        :param username: Username for the credentials
+        :param password: Password for the credentials
+        :param logon_type: Type of logon - "netonly" (LOGON_NETCREDENTIALS_ONLY) or "interactive" (LOGON_WITH_PROFILE)
         """
         self.parent_pool = parent_pool
         self.username = username
         self.password = password
+        self.logon_type = logon_type
         self._is_netonly = True
         self._netonly_process = None
         
@@ -571,20 +573,21 @@ class NetOnlyRunspacePool:
     
     def _init_netonly_process(self):
         """
-        Initialize a PowerShell process with CreateProcessWithLogonW and LOGON_NETCREDENTIALS_ONLY.
+        Initialize a PowerShell process with CreateProcessWithLogonW.
         
-        This creates a background PowerShell session that runs with network-only credentials.
-        The process is created using P/Invoke to call CreateProcessWithLogonW with the
-        LOGON_NETCREDENTIALS_ONLY (0x00000002) flag.
+        This creates a background PowerShell session that runs with the specified credentials.
+        The process is created using P/Invoke to call CreateProcessWithLogonW with either:
+        - LOGON_NETCREDENTIALS_ONLY (0x00000002) flag for netonly mode
+        - LOGON_WITH_PROFILE (0x00000001) flag for interactive mode
         """
-        log.info("Initializing NetOnly process with CreateProcessWithLogonW...")
+        log.info(f"Initializing process with CreateProcessWithLogonW (logon_type={self.logon_type})...")
         
         if not self.username or not self.password:
-            log.warning("Username or password not provided for NetOnly process. Using parent pool context.")
+            log.warning("Username or password not provided. Using parent pool context.")
             return
         
         try:
-            # Get the PowerShell script for creating the netonly process
+            # Get the PowerShell script for creating the process
             script = get_ps_script("netonly.ps1")
             
             # Parse domain and username if provided in DOMAIN\USERNAME format
@@ -593,12 +596,13 @@ class NetOnlyRunspacePool:
             if "\\" in self.username:
                 domain, username = self.username.split("\\", 1)
             
-            # Create a PowerShell instance to run the netonly script
+            # Create a PowerShell instance to run the script
             ps = PowerShell(self.parent_pool)
             ps.add_script(script)
             ps.add_parameter("Username", username)
             ps.add_parameter("Password", self.password)
             ps.add_parameter("Domain", domain)
+            ps.add_parameter("LogonType", self.logon_type)
             ps.add_parameter("CommandLine", "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3600\"")
             
             # Execute the script
@@ -616,22 +620,22 @@ class NetOnlyRunspacePool:
                         "ProcessId": result.get("ProcessId"),
                         "ProcessHandle": result.get("ProcessHandle")
                     }
-                    log.info(f"NetOnly process created successfully with PID: {result.get('ProcessId')}")
-                    print(GREEN + f"[+] NetOnly process created with PID: {result.get('ProcessId')}" + RESET)
+                    log.info(f"Process created successfully with PID: {result.get('ProcessId')} (logon_type={self.logon_type})")
+                    print(GREEN + f"[+] Process created with PID: {result.get('ProcessId')} ({self.logon_type} mode)" + RESET)
                 elif result.get("Type") == "Error":
-                    log.error(f"Failed to create NetOnly process: {result.get('Message')}")
-                    print(RED + f"[-] Failed to create NetOnly process: {result.get('Message')}" + RESET)
+                    log.error(f"Failed to create process: {result.get('Message')}")
+                    print(RED + f"[-] Failed to create process: {result.get('Message')}" + RESET)
             
             # Check for errors in the stream
             if ps.streams.error:
                 for error in ps.streams.error:
-                    log.error(f"Error creating NetOnly process: {error._to_string}")
+                    log.error(f"Error creating process: {error._to_string}")
                     print(RED + f"[-] Error: {error._to_string}" + RESET)
         
         except Exception as e:
-            log.error(f"Exception while initializing NetOnly process: {str(e)}")
+            log.error(f"Exception while initializing process: {str(e)}")
             log.debug(traceback.format_exc())
-            print(RED + f"[-] Exception while initializing NetOnly process: {str(e)}" + RESET)
+            print(RED + f"[-] Exception while initializing process: {str(e)}" + RESET)
             print(YELLOW + "[*] Falling back to parent pool context." + RESET)
     
     @property
@@ -986,23 +990,30 @@ def run_ps(r_pool: RunspacePool, local_path: str) -> None:
 def change_logon_type(r_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None) -> None:
     """Change shell logon type with CreateProcessWithLogonW style execution.
     
-    Creates a NetOnlyRunspacePool that uses LOGON_NETCREDENTIALS_ONLY flag
-    and enters a nested interactive shell.
+    Creates a NetOnlyRunspacePool that uses either LOGON_WITH_PROFILE (when credentials
+    are provided) or LOGON_NETCREDENTIALS_ONLY (when no credentials) and enters a nested
+    interactive shell.
     
     :param r_pool: The parent RunspacePool
-    :param username: Username for the netonly credentials
-    :param password: Password for the netonly credentials
+    :param username: Username for the credentials
+    :param password: Password for the credentials
     """
-    log.info("Creating NetOnly RunspacePool...")
+    # Determine the logon type based on whether credentials are provided
+    if username and password:
+        logon_type = "interactive"
+        log.info("Creating RunspacePool with interactive logon (LOGON_WITH_PROFILE)...")
+    else:
+        logon_type = "netonly"
+        log.info("Creating RunspacePool with netonly logon (LOGON_NETCREDENTIALS_ONLY)...")
     
     # Create a NetOnlyRunspacePool that wraps the parent pool
-    netonly_pool = NetOnlyRunspacePool(r_pool, username=username, password=password)
+    netonly_pool = NetOnlyRunspacePool(r_pool, username=username, password=password, logon_type=logon_type)
     
     # Enter the interactive shell with the NetOnlyRunspacePool
     # Pass nested=True to hide the "interactive" command
     interactive_shell(netonly_pool, username=username, password=password, nested=True)
     
-    log.info("Exited from NetOnly RunspacePool.")
+    log.info("Exited from RunspacePool.")
 
               
 
