@@ -117,8 +117,25 @@ class DelayedKeyboardInterrupt:
 
 
 def run_ps_cmd(r_pool: RunspacePool, command: str) -> tuple[str, list, bool]:
-    """Runs a PowerShell command and returns the output, streams, and error status."""
+    """
+    Runs a PowerShell command and returns the output, streams, and error status.
+    
+    If r_pool is a NetOnlyRunspacePool, the command is routed to the nested process.
+    Otherwise, it's executed in the parent RunspacePool.
+    """
     log.info("Executing command: {}".format(command))
+    
+    # Check if this is a NetOnlyRunspacePool and route accordingly
+    # Use hasattr to avoid forward reference issues
+    if hasattr(r_pool, 'execute_command') and hasattr(r_pool, '_pipe_name'):
+        output, errors, had_errors = r_pool.execute_command(command)
+        # Create a mock streams object for compatibility
+        class MockStreams:
+            def __init__(self, errors):
+                self.error = errors
+        return "\n".join(output) if output else "", MockStreams(errors), had_errors
+    
+    # Default execution in parent pool
     ps = PowerShell(r_pool)
     ps.add_cmdlet("Invoke-Expression").add_parameter("Command", command)
     ps.add_cmdlet("Out-String").add_parameter("Stream")
@@ -136,6 +153,11 @@ def get_prompt(r_pool: RunspacePool, mode: str = None) -> str:
     output, streams, had_errors = run_ps_cmd(
         r_pool, "$pwd.Path"
     )  # Get current working directory
+    
+    # Auto-detect mode if r_pool is NetOnlyRunspacePool
+    if mode is None and hasattr(r_pool, 'logon_type'):
+        mode = r_pool.logon_type
+    
     if not had_errors:
         if mode:
             return f"{RED}evil-winrm-py{RESET} {YELLOW}{BOLD}PS-{mode}{RESET} {output}> "
@@ -547,9 +569,49 @@ class NetOnlyRunspacePool:
     This allows running commands in a context that uses different credentials,
     similar to 'runas /netonly' or interactive logon.
     
-    The implementation creates a background PowerShell job on the remote host that
-    runs with the specified credentials. Commands are executed in this context
-    by invoking them through the job.
+    The implementation creates a background PowerShell process on the remote host that
+    runs with the specified credentials and listens on a named pipe for commands.
+    Commands are executed in this context by sending them through the named pipe IPC mechanism.
+    
+    IPC Mechanism:
+    - A unique named pipe is created for each NetOnlyRunspacePool instance
+    - The nested process runs netonly_listener.ps1 which creates a named pipe server
+    - Commands are sent via netonly_execute.ps1 which acts as a named pipe client
+    - Output and error streams are captured and returned as JSON
+    
+    Example Usage:
+    
+        # Create a NetOnlyRunspacePool with alternate credentials
+        netonly_pool = NetOnlyRunspacePool(
+            parent_pool=r_pool,
+            username="DOMAIN\\user",
+            password="password123",
+            logon_type="netonly"  # or "interactive"
+        )
+        
+        # Execute a single command in the nested process
+        output, errors, had_errors = netonly_pool.execute_command("whoami /all")
+        for line in output:
+            print(line)
+        
+        # Execute a script in the nested process
+        script = '''
+        $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        Write-Output "Running as: $user"
+        Get-Process | Select-Object -First 5
+        '''
+        output, errors, had_errors = netonly_pool.execute_script(script)
+        
+        # Run a local PowerShell script file in the nested process
+        # (automatically routed when using run_ps with NetOnlyRunspacePool)
+        run_ps(netonly_pool, "/path/to/script.ps1")
+        
+        # Clean up when done
+        netonly_pool.cleanup()
+    
+    Note: The NetOnlyRunspacePool is automatically used when entering interactive
+    mode with the 'interactive' command in the evil-winrm-py shell. Commands and
+    scripts are transparently routed to the nested process.
     """
     
     def __init__(self, parent_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None, logon_type: str = "netonly"):
@@ -567,6 +629,8 @@ class NetOnlyRunspacePool:
         self.logon_type = logon_type
         self._is_netonly = True
         self._netonly_process = None
+        self._pipe_name = None
+        self._temp_script_path = None
         
         # Initialize the netonly process
         self._init_netonly_process()
@@ -579,6 +643,8 @@ class NetOnlyRunspacePool:
         The process is created using P/Invoke to call CreateProcessWithLogonW with either:
         - LOGON_NETCREDENTIALS_ONLY (0x00000002) flag for netonly mode
         - LOGON_WITH_PROFILE (0x00000001) flag for interactive mode
+        
+        The nested process runs a listener script that creates a named pipe server for IPC.
         """
         log.info(f"Initializing process with CreateProcessWithLogonW (logon_type={self.logon_type})...")
         
@@ -587,6 +653,39 @@ class NetOnlyRunspacePool:
             return
         
         try:
+            # Generate a unique pipe name for this session
+            import uuid
+            self._pipe_name = f"evil_winrm_netonly_{uuid.uuid4().hex[:8]}"
+            log.info(f"Generated pipe name: {self._pipe_name}")
+            
+            # Get the listener script content
+            listener_script = get_ps_script("netonly_listener.ps1")
+            
+            # Upload the listener script to a temporary file on the remote host
+            # Use a unique temporary file name
+            temp_script_name = f"netonly_listener_{uuid.uuid4().hex[:8]}.ps1"
+            self._temp_script_path = f"$env:TEMP\\{temp_script_name}"
+            
+            # Upload the listener script
+            ps_upload = PowerShell(self.parent_pool)
+            ps_upload.add_script(f"Set-Content -Path {self._temp_script_path} -Value @'\n{listener_script}\n'@")
+            ps_upload.invoke()
+            
+            if ps_upload.had_errors:
+                log.error("Failed to upload listener script")
+                for error in ps_upload.streams.error:
+                    log.error(f"Error: {error._to_string}")
+                print(RED + "[-] Failed to upload listener script" + RESET)
+                return
+            
+            log.info(f"Uploaded listener script to: {self._temp_script_path}")
+            
+            # Create the command line that will run the listener
+            command_line = (
+                f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                f"-File {self._temp_script_path} -PipeName {self._pipe_name}"
+            )
+            
             # Get the PowerShell script for creating the process
             script = get_ps_script("netonly.ps1")
             
@@ -603,7 +702,7 @@ class NetOnlyRunspacePool:
             ps.add_parameter("Password", self.password)
             ps.add_parameter("Domain", domain)
             ps.add_parameter("LogonType", self.logon_type)
-            ps.add_parameter("CommandLine", "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3600\"")
+            ps.add_parameter("CommandLine", command_line)
             
             # Execute the script
             ps.begin_invoke()
@@ -618,10 +717,22 @@ class NetOnlyRunspacePool:
                 if result.get("Type") == "Success":
                     self._netonly_process = {
                         "ProcessId": result.get("ProcessId"),
-                        "ProcessHandle": result.get("ProcessHandle")
+                        "ProcessHandle": result.get("ProcessHandle"),
+                        "PipeName": self._pipe_name
                     }
                     log.info(f"Process created successfully with PID: {result.get('ProcessId')} (logon_type={self.logon_type})")
                     print(GREEN + f"[+] Process created with PID: {result.get('ProcessId')} ({self.logon_type} mode)" + RESET)
+                    
+                    # Wait a moment for the listener to start
+                    time.sleep(1)
+                    
+                    # Verify the listener is active
+                    if self._check_listener_status():
+                        log.info("Listener is active and ready for commands")
+                        print(GREEN + "[+] Command listener is active" + RESET)
+                    else:
+                        log.warning("Listener may not be active yet")
+                        print(YELLOW + "[!] Command listener status unknown" + RESET)
                 elif result.get("Type") == "Error":
                     log.error(f"Failed to create process: {result.get('Message')}")
                     print(RED + f"[-] Failed to create process: {result.get('Message')}" + RESET)
@@ -637,6 +748,212 @@ class NetOnlyRunspacePool:
             log.debug(traceback.format_exc())
             print(RED + f"[-] Exception while initializing process: {str(e)}" + RESET)
             print(YELLOW + "[*] Falling back to parent pool context." + RESET)
+    
+    def _check_listener_status(self) -> bool:
+        """
+        Check if the listener is active and responding.
+        
+        :return: True if listener is active, False otherwise
+        """
+        if not self._netonly_process or not self._pipe_name:
+            return False
+        
+        try:
+            # Get the execute script
+            script = get_ps_script("netonly_execute.ps1")
+            
+            # Create a PowerShell instance to check status
+            ps = PowerShell(self.parent_pool)
+            ps.add_script(script)
+            ps.add_parameter("PipeName", self._pipe_name)
+            ps.add_parameter("Action", "Status")
+            ps.add_parameter("TimeoutSeconds", 5)
+            ps.invoke()
+            
+            # Check the response
+            if ps.output:
+                result = json.loads(ps.output[0])
+                return result.get("Type") == "Success"
+            
+            return False
+        except Exception as e:
+            log.debug(f"Error checking listener status: {str(e)}")
+            return False
+    
+    def execute_command(self, command: str, timeout: int = 300) -> tuple[list, list, bool]:
+        """
+        Execute a PowerShell command in the nested process.
+        
+        This sends the command to the nested process via the named pipe IPC mechanism.
+        The command is executed in the context of the credentials provided during initialization.
+        
+        :param command: The PowerShell command to execute
+        :param timeout: Timeout in seconds for command execution (default: 300)
+        :return: Tuple of (output_lines, error_lines, had_errors)
+        
+        Example:
+            >>> pool = NetOnlyRunspacePool(parent_pool, username="DOMAIN\\user", password="pass")
+            >>> output, errors, had_errors = pool.execute_command("Get-Process")
+            >>> for line in output:
+            ...     print(line)
+        """
+        if not self._netonly_process or not self._pipe_name:
+            log.warning("NetOnly process not initialized, falling back to parent pool")
+            # Fall back to parent pool execution
+            return self._execute_in_parent(command)
+        
+        try:
+            log.info(f"Executing command in nested process via pipe: {self._pipe_name}")
+            
+            # Get the execute script
+            script = get_ps_script("netonly_execute.ps1")
+            
+            # Create a PowerShell instance to send the command
+            ps = PowerShell(self.parent_pool)
+            ps.add_script(script)
+            ps.add_parameter("PipeName", self._pipe_name)
+            ps.add_parameter("Command", command)
+            ps.add_parameter("Action", "Execute")
+            ps.add_parameter("TimeoutSeconds", timeout)
+            ps.invoke()
+            
+            # Parse the response
+            if ps.output:
+                result = json.loads(ps.output[0])
+                if result.get("Type") == "Success":
+                    output = result.get("Output", [])
+                    errors = result.get("Errors", [])
+                    had_errors = len(errors) > 0
+                    
+                    log.info(f"Command executed successfully in nested process")
+                    return (output, errors, had_errors)
+                elif result.get("Type") == "Error":
+                    error_msg = result.get("Message", "Unknown error")
+                    log.error(f"Error executing command in nested process: {error_msg}")
+                    return ([], [error_msg], True)
+            
+            # If we get here, something went wrong
+            log.error("No output received from nested process")
+            return ([], ["No response from nested process"], True)
+            
+        except Exception as e:
+            log.error(f"Exception executing command in nested process: {str(e)}")
+            log.debug(traceback.format_exc())
+            return ([], [str(e)], True)
+    
+    def execute_script(self, script: str, timeout: int = 300) -> tuple[list, list, bool]:
+        """
+        Execute a PowerShell script in the nested process.
+        
+        This sends the script to the nested process via the named pipe IPC mechanism.
+        The script is executed in the context of the credentials provided during initialization.
+        
+        :param script: The PowerShell script to execute
+        :param timeout: Timeout in seconds for script execution (default: 300)
+        :return: Tuple of (output_lines, error_lines, had_errors)
+        
+        Example:
+            >>> pool = NetOnlyRunspacePool(parent_pool, username="DOMAIN\\user", password="pass")
+            >>> script = '''
+            ... $processes = Get-Process
+            ... Write-Output "Found $($processes.Count) processes"
+            ... '''
+            >>> output, errors, had_errors = pool.execute_script(script)
+        """
+        if not self._netonly_process or not self._pipe_name:
+            log.warning("NetOnly process not initialized, falling back to parent pool")
+            # Fall back to parent pool execution
+            return self._execute_script_in_parent(script)
+        
+        try:
+            log.info(f"Executing script in nested process via pipe: {self._pipe_name}")
+            
+            # Get the execute script
+            execute_script_content = get_ps_script("netonly_execute.ps1")
+            
+            # Create a PowerShell instance to send the script
+            ps = PowerShell(self.parent_pool)
+            ps.add_script(execute_script_content)
+            ps.add_parameter("PipeName", self._pipe_name)
+            ps.add_parameter("Script", script)
+            ps.add_parameter("Action", "Execute")
+            ps.add_parameter("TimeoutSeconds", timeout)
+            ps.invoke()
+            
+            # Parse the response
+            if ps.output:
+                result = json.loads(ps.output[0])
+                if result.get("Type") == "Success":
+                    output = result.get("Output", [])
+                    errors = result.get("Errors", [])
+                    had_errors = len(errors) > 0
+                    
+                    log.info(f"Script executed successfully in nested process")
+                    return (output, errors, had_errors)
+                elif result.get("Type") == "Error":
+                    error_msg = result.get("Message", "Unknown error")
+                    log.error(f"Error executing script in nested process: {error_msg}")
+                    return ([], [error_msg], True)
+            
+            # If we get here, something went wrong
+            log.error("No output received from nested process")
+            return ([], ["No response from nested process"], True)
+            
+        except Exception as e:
+            log.error(f"Exception executing script in nested process: {str(e)}")
+            log.debug(traceback.format_exc())
+            return ([], [str(e)], True)
+    
+    def _execute_in_parent(self, command: str) -> tuple[list, list, bool]:
+        """Fall back to executing command in parent pool."""
+        ps = PowerShell(self.parent_pool)
+        ps.add_cmdlet("Invoke-Expression").add_parameter("Command", command)
+        ps.add_cmdlet("Out-String").add_parameter("Stream")
+        ps.invoke()
+        return (ps.output, [str(e) for e in ps.streams.error], ps.had_errors)
+    
+    def _execute_script_in_parent(self, script: str) -> tuple[list, list, bool]:
+        """Fall back to executing script in parent pool."""
+        ps = PowerShell(self.parent_pool)
+        ps.add_script(script)
+        ps.invoke()
+        return (ps.output, [str(e) for e in ps.streams.error], ps.had_errors)
+    
+    def cleanup(self):
+        """
+        Clean up the nested process and close the named pipe.
+        
+        This should be called when done with the NetOnlyRunspacePool to properly
+        terminate the listener process and free resources.
+        """
+        if not self._netonly_process or not self._pipe_name:
+            return
+        
+        try:
+            log.info("Cleaning up NetOnly process...")
+            
+            # Send exit command to listener
+            script = get_ps_script("netonly_execute.ps1")
+            ps = PowerShell(self.parent_pool)
+            ps.add_script(script)
+            ps.add_parameter("PipeName", self._pipe_name)
+            ps.add_parameter("Action", "Exit")
+            ps.add_parameter("TimeoutSeconds", 5)
+            ps.invoke()
+            
+            # Remove the temporary listener script
+            if self._temp_script_path:
+                try:
+                    ps_cleanup = PowerShell(self.parent_pool)
+                    ps_cleanup.add_script(f"Remove-Item -Path {self._temp_script_path} -Force -ErrorAction SilentlyContinue")
+                    ps_cleanup.invoke()
+                    log.info(f"Removed temporary listener script: {self._temp_script_path}")
+                except Exception as e:
+                    log.debug(f"Error removing temporary script: {str(e)}")
+            
+            log.info("NetOnly process cleanup complete")
+        except Exception as e:
+            log.debug(f"Error during cleanup: {str(e)}")
     
     @property
     def connection(self):
@@ -952,12 +1269,38 @@ def load_ps(r_pool: RunspacePool, local_path: str):
 
 
 def run_ps(r_pool: RunspacePool, local_path: str) -> None:
-    """Runs a local PowerShell script on the remote host."""
-    ps = PowerShell(r_pool)
+    """
+    Runs a local PowerShell script on the remote host.
+    
+    If r_pool is a NetOnlyRunspacePool, the script is routed to the nested process.
+    Otherwise, it's executed in the parent RunspacePool.
+    """
     try:
         with open(local_path, "r") as script_file:
             script = script_file.read()
 
+        # Check if this is a NetOnlyRunspacePool and route accordingly
+        if hasattr(r_pool, 'execute_script') and hasattr(r_pool, '_pipe_name'):
+            output, errors, had_errors = r_pool.execute_script(script)
+            
+            # Print output
+            for line in output:
+                print(line)
+            
+            # Handle errors
+            if had_errors or errors:
+                print(RED + "[-] Failed to run PowerShell script." + RESET)
+                log.error(f"Failed to run PowerShell script '{local_path}'.")
+                for error in errors:
+                    print(RED + str(error) + RESET)
+                    log.error("Error: {}".format(error))
+            else:
+                print(GREEN + "[+] PowerShell script ran successfully." + RESET)
+                log.info(f"PowerShell script '{local_path}' ran successfully.")
+            return
+        
+        # Default execution in parent pool
+        ps = PowerShell(r_pool)
         ps.add_script(script)
         ps.begin_invoke()
 
@@ -982,7 +1325,7 @@ def run_ps(r_pool: RunspacePool, local_path: str) -> None:
             print(GREEN + "[+] PowerShell script ran successfully." + RESET)
             log.info(f"PowerShell script '{local_path}' ran successfully.")
     except KeyboardInterrupt:
-        if ps.state == PSInvocationState.RUNNING:
+        if 'ps' in locals() and ps.state == PSInvocationState.RUNNING:
             log.info("Stopping command execution.")
             ps.stop()
 
@@ -1057,6 +1400,9 @@ def interactive_shell(r_pool: RunspacePool, username: Optional[str]=None, passwo
             # Check for exit command
             if command_lower == "exit":
                 log.info("Exiting interactive shell.")
+                # Clean up NetOnlyRunspacePool if needed
+                if hasattr(r_pool, 'cleanup'):
+                    r_pool.cleanup()
                 return
             elif command_lower in ["clear", "cls"]:
                 log.info("Clearing the screen.")

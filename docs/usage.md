@@ -271,6 +271,18 @@ evil-winrm-py PS C:\Users\john\Documents>
 
 To exit interactive mode and return to the normal shell, simply type `exit`.
 
+#### Technical Implementation
+
+The interactive logon mode uses a sophisticated IPC (Inter-Process Communication) mechanism:
+
+- A nested PowerShell process is created using `CreateProcessWithLogonW` with alternate credentials
+- A unique named pipe is established for communication between the parent and nested processes
+- Commands and scripts are transparently routed to the nested process via the named pipe
+- Output and error streams are captured and returned to the caller
+- All file operations (`upload`, `download`, `runps`, `loadps`) work seamlessly in this mode
+
+For detailed information about the IPC mechanism, see [NetOnlyRunspacePool IPC Documentation](netonly_ipc.md).
+
 ## Additional Options
 
 ### Using No Colors
