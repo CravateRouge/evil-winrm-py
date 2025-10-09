@@ -579,16 +579,60 @@ class NetOnlyRunspacePool:
         """
         log.info("Initializing NetOnly process with CreateProcessWithLogonW...")
         
-        # For now, we'll use a simplified approach that delegates to the parent pool
-        # A full implementation would require creating a true netonly process using
-        # CreateProcessWithLogonW via PowerShell P/Invoke
-        # 
-        # The key concept is that commands executed through this pool should run
-        # in a context created with LOGON_NETCREDENTIALS_ONLY, which allows
-        # network operations to use the specified credentials while local operations
-        # use the current user's context.
+        if not self.username or not self.password:
+            log.warning("Username or password not provided for NetOnly process. Using parent pool context.")
+            return
         
-        log.info("NetOnly process initialized (using parent pool context)")
+        try:
+            # Get the PowerShell script for creating the netonly process
+            script = get_ps_script("netonly.ps1")
+            
+            # Parse domain and username if provided in DOMAIN\USERNAME format
+            domain = "."
+            username = self.username
+            if "\\" in self.username:
+                domain, username = self.username.split("\\", 1)
+            
+            # Create a PowerShell instance to run the netonly script
+            ps = PowerShell(self.parent_pool)
+            ps.add_script(script)
+            ps.add_parameter("Username", username)
+            ps.add_parameter("Password", self.password)
+            ps.add_parameter("Domain", domain)
+            ps.add_parameter("CommandLine", "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 3600\"")
+            
+            # Execute the script
+            ps.begin_invoke()
+            
+            # Wait for the script to complete
+            while ps.state == PSInvocationState.RUNNING:
+                ps.poll_invoke()
+            
+            # Check the output
+            if ps.output:
+                result = json.loads(ps.output[0])
+                if result.get("Type") == "Success":
+                    self._netonly_process = {
+                        "ProcessId": result.get("ProcessId"),
+                        "ProcessHandle": result.get("ProcessHandle")
+                    }
+                    log.info(f"NetOnly process created successfully with PID: {result.get('ProcessId')}")
+                    print(GREEN + f"[+] NetOnly process created with PID: {result.get('ProcessId')}" + RESET)
+                elif result.get("Type") == "Error":
+                    log.error(f"Failed to create NetOnly process: {result.get('Message')}")
+                    print(RED + f"[-] Failed to create NetOnly process: {result.get('Message')}" + RESET)
+            
+            # Check for errors in the stream
+            if ps.streams.error:
+                for error in ps.streams.error:
+                    log.error(f"Error creating NetOnly process: {error._to_string}")
+                    print(RED + f"[-] Error: {error._to_string}" + RESET)
+        
+        except Exception as e:
+            log.error(f"Exception while initializing NetOnly process: {str(e)}")
+            log.debug(traceback.format_exc())
+            print(RED + f"[-] Exception while initializing NetOnly process: {str(e)}" + RESET)
+            print(YELLOW + "[*] Falling back to parent pool context." + RESET)
     
     @property
     def connection(self):
