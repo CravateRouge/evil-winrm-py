@@ -630,6 +630,7 @@ class NetOnlyRunspacePool:
         self._is_netonly = True
         self._netonly_process = None
         self._pipe_name = None
+        self._temp_script_path = None
         
         # Initialize the netonly process
         self._init_netonly_process()
@@ -660,13 +661,29 @@ class NetOnlyRunspacePool:
             # Get the listener script content
             listener_script = get_ps_script("netonly_listener.ps1")
             
-            # Encode the listener script as base64 to pass as command
-            listener_script_b64 = base64.b64encode(listener_script.encode('utf-16le')).decode('ascii')
+            # Upload the listener script to a temporary file on the remote host
+            # Use a unique temporary file name
+            temp_script_name = f"netonly_listener_{uuid.uuid4().hex[:8]}.ps1"
+            self._temp_script_path = f"$env:TEMP\\{temp_script_name}"
+            
+            # Upload the listener script
+            ps_upload = PowerShell(self.parent_pool)
+            ps_upload.add_script(f"Set-Content -Path {self._temp_script_path} -Value @'\n{listener_script}\n'@")
+            ps_upload.invoke()
+            
+            if ps_upload.had_errors:
+                log.error("Failed to upload listener script")
+                for error in ps_upload.streams.error:
+                    log.error(f"Error: {error._to_string}")
+                print(RED + "[-] Failed to upload listener script" + RESET)
+                return
+            
+            log.info(f"Uploaded listener script to: {self._temp_script_path}")
             
             # Create the command line that will run the listener
             command_line = (
-                f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {listener_script_b64} "
-                f"-PipeName {self._pipe_name}"
+                f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                f"-File {self._temp_script_path} -PipeName {self._pipe_name}"
             )
             
             # Get the PowerShell script for creating the process
@@ -923,6 +940,16 @@ class NetOnlyRunspacePool:
             ps.add_parameter("Action", "Exit")
             ps.add_parameter("TimeoutSeconds", 5)
             ps.invoke()
+            
+            # Remove the temporary listener script
+            if self._temp_script_path:
+                try:
+                    ps_cleanup = PowerShell(self.parent_pool)
+                    ps_cleanup.add_script(f"Remove-Item -Path {self._temp_script_path} -Force -ErrorAction SilentlyContinue")
+                    ps_cleanup.invoke()
+                    log.info(f"Removed temporary listener script: {self._temp_script_path}")
+                except Exception as e:
+                    log.debug(f"Error removing temporary script: {str(e)}")
             
             log.info("NetOnly process cleanup complete")
         except Exception as e:

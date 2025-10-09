@@ -71,10 +71,13 @@ The `NetOnlyRunspacePool` class implements a mechanism to execute PowerShell com
    )
    ```
    - Generates a unique named pipe name
-   - Encodes `netonly_listener.ps1` as base64
+   - Uploads `netonly_listener.ps1` to a temporary location on the remote host
    - Calls `netonly.ps1` to create a process with CreateProcessWithLogonW
-   - The new process runs the encoded listener script
+   - The new process runs the listener script from the temporary file
    - Verifies the listener is active
+   
+   Note: The listener script is uploaded as a file rather than encoded in the command line
+   to avoid Windows command line length limitations (8191 characters).
 
 2. **Command Execution**
    ```python
@@ -103,6 +106,7 @@ The `NetOnlyRunspacePool` class implements a mechanism to execute PowerShell com
    - Sends an "Exit" command to the listener
    - Listener gracefully shuts down
    - Named pipe is closed
+   - Temporary listener script file is removed from remote host
 
 ## Named Pipe Communication Protocol
 
