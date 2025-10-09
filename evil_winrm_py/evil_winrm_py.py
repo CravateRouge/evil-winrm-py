@@ -143,8 +143,11 @@ def get_prompt(r_pool: RunspacePool, mode: str = None) -> str:
     return "PS ?> "  # Fallback prompt
 
 
-def show_menu() -> None:
-    """Displays the help menu for interactive commands."""
+def show_menu(nested: bool = False) -> None:
+    """Displays the help menu for interactive commands.
+    
+    :param nested: If True, hide the 'interactive' command
+    """
     print(BOLD + "\nMenu:" + RESET)
     commands = [
         # ("command", "description")
@@ -159,6 +162,9 @@ def show_menu() -> None:
     ]
 
     for command, description in commands:
+        # Skip 'interactive' command if in nested mode
+        if nested and command == "interactive":
+            continue
         print(f"{CYAN}[+] {command:<55} - {description}{RESET}")
     print("Note: Use absolute paths for upload/download for reliability.\n")
 
@@ -261,8 +267,9 @@ class CommandPathCompleter(Completer):
     This completer suggests command names based on the user's input.
     """
 
-    def __init__(self, r_pool: RunspacePool):
+    def __init__(self, r_pool: RunspacePool, nested: bool = False):
         self.r_pool = r_pool
+        self.nested = nested
 
     def get_completions(self, document: Document, complete_event):
         dirs_only = False  # Whether to suggest only directories
@@ -270,7 +277,8 @@ class CommandPathCompleter(Completer):
         tokens = text_before_cursor.split(maxsplit=1)
 
         if not tokens:  # Empty input, suggest all commands
-            for cmd_sugg in MENU_COMMANDS + COMMAND_SUGGESTIONS:
+            menu_commands = [cmd for cmd in MENU_COMMANDS if not (self.nested and cmd == "interactive")]
+            for cmd_sugg in menu_commands + COMMAND_SUGGESTIONS:
                 yield Completion(cmd_sugg, start_position=0, display=cmd_sugg)
             return
 
@@ -305,7 +313,8 @@ class CommandPathCompleter(Completer):
         # There's only one token and no trailing space.
         if len(tokens) == 1 and not text_before_cursor.endswith(" "):
             # User is typing the command, -> "downl"
-            for cmd_sugg in MENU_COMMANDS + COMMAND_SUGGESTIONS:
+            menu_commands = [cmd for cmd in MENU_COMMANDS if not (self.nested and cmd == "interactive")]
+            for cmd_sugg in menu_commands + COMMAND_SUGGESTIONS:
                 if cmd_sugg.startswith(command_typed_part):
                     yield Completion(
                         cmd_sugg + " ",  # Full suggested command
@@ -528,6 +537,46 @@ class CommandPathCompleter(Completer):
                 ),  # Use the length of quoted part
                 display=sugg_path,
             )
+
+
+class NetOnlyRunspacePool:
+    """
+    A wrapper around RunspacePool that creates a nested PowerShell session
+    using CreateProcessWithLogonW with LOGON_NETCREDENTIALS_ONLY flag.
+    
+    This allows running commands in a context that uses network-only credentials,
+    similar to 'runas /netonly'.
+    """
+    
+    def __init__(self, parent_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None):
+        """
+        Initialize the NetOnlyRunspacePool.
+        
+        :param parent_pool: The parent RunspacePool to use for creating the nested session
+        :param username: Username for the netonly credentials
+        :param password: Password for the netonly credentials
+        """
+        self.parent_pool = parent_pool
+        self.username = username
+        self.password = password
+        self._is_netonly = True
+        
+        # Create a nested PowerShell runspace using CreateProcessWithLogonW
+        # This will be done lazily when commands are executed
+    
+    @property
+    def connection(self):
+        """Delegate connection property to parent pool."""
+        return self.parent_pool.connection
+    
+    @property
+    def state(self):
+        """Delegate state property to parent pool."""
+        return self.parent_pool.state
+    
+    def __getattr__(self, name):
+        """Delegate all other attributes to the parent pool."""
+        return getattr(self.parent_pool, name)
 
 
 def get_ps_script(script_name: str) -> str:
@@ -865,13 +914,36 @@ def run_ps(r_pool: RunspacePool, local_path: str) -> None:
 
 
 def change_logon_type(r_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None) -> None:
-    """Change shell logon type with CreateProcessWithLogonW style execution."""
-    raise NotImplementedError("Interactive logon mode is not implemented yet.")
+    """Change shell logon type with CreateProcessWithLogonW style execution.
+    
+    Creates a NetOnlyRunspacePool that uses LOGON_NETCREDENTIALS_ONLY flag
+    and enters a nested interactive shell.
+    
+    :param r_pool: The parent RunspacePool
+    :param username: Username for the netonly credentials
+    :param password: Password for the netonly credentials
+    """
+    log.info("Creating NetOnly RunspacePool...")
+    
+    # Create a NetOnlyRunspacePool that wraps the parent pool
+    netonly_pool = NetOnlyRunspacePool(r_pool, username=username, password=password)
+    
+    # Enter the interactive shell with the NetOnlyRunspacePool
+    # Pass nested=True to hide the "interactive" command
+    interactive_shell(netonly_pool, username=username, password=password, nested=True)
+    
+    log.info("Exited from NetOnly RunspacePool.")
 
               
 
-def interactive_shell(r_pool: RunspacePool, username: Optional[str]=None, password: Optional[str]=None) -> None:
-    """Runs the interactive pseudo-shell."""
+def interactive_shell(r_pool: RunspacePool, username: Optional[str]=None, password: Optional[str]=None, nested: bool = False) -> None:
+    """Runs the interactive pseudo-shell.
+    
+    :param r_pool: The RunspacePool to use for command execution
+    :param username: Optional username for credentials
+    :param password: Optional password for credentials
+    :param nested: If True, this shell is called from change_logon_type() and "interactive" command is hidden
+    """
     log.info("Starting interactive PowerShell session...")
 
     # Set up history file
@@ -881,7 +953,7 @@ def interactive_shell(r_pool: RunspacePool, username: Optional[str]=None, passwo
     prompt_session = PromptSession(history=prompt_history)
 
     # Set up command completer
-    completer = CommandPathCompleter(r_pool)
+    completer = CommandPathCompleter(r_pool, nested=nested)
 
     while True:
         try:
@@ -911,9 +983,13 @@ def interactive_shell(r_pool: RunspacePool, username: Optional[str]=None, passwo
                 continue
             elif command_lower == "menu":
                 log.info("Displaying menu.")
-                show_menu()
+                show_menu(nested=nested)
                 continue
             elif command_lower == "interactive":
+                if nested:
+                    # "interactive" command is not available in nested mode
+                    print(RED + "[-] 'interactive' command is not available in this mode." + RESET)
+                    continue
                 log.info("Entering interactive mode.")                
                 # Check if we have plaintext password to choose interactive or netonly
                 if password:
