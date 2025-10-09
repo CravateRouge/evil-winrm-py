@@ -541,43 +541,63 @@ class CommandPathCompleter(Completer):
 
 class NetOnlyShellWrapper:
     """
-    A wrapper around the parent RunspacePool's shell that redirects commands
-    to execute in a PSSession with alternate credentials.
+    A wrapper around the parent RunspacePool's shell that can redirect commands
+    to execute in the context of alternate credentials.
     
-    This wrapper intercepts shell commands sent by PowerShell objects and executes
-    them in the context of the PSSession, which runs with alternate credentials.
+    This wrapper implements the same interface as WinRS shell and can be used
+    by PowerShell objects. It delegates all operations to the parent shell while
+    maintaining the ability to intercept and redirect commands in the future.
     """
     
-    def __init__(self, parent_shell, parent_pool: RunspacePool, session_id: Optional[int] = None):
+    def __init__(self, parent_shell, parent_pool: RunspacePool, username: Optional[str] = None, 
+                 password: Optional[str] = None, logon_type: str = "netonly"):
         """
         Initialize the shell wrapper.
         
         :param parent_shell: The parent RunspacePool's shell (WinRS object)
         :param parent_pool: The parent RunspacePool
-        :param session_id: The PSSession ID to execute commands in
+        :param username: Username for alternate credentials
+        :param password: Password for alternate credentials
+        :param logon_type: Type of logon (netonly or interactive)
         """
         self.parent_shell = parent_shell
         self.parent_pool = parent_pool
-        self.session_id = session_id
-        log.debug(f"NetOnlyShellWrapper initialized with session_id: {session_id}")
+        self.username = username
+        self.password = password
+        self.logon_type = logon_type
+        log.debug(f"NetOnlyShellWrapper initialized (logon_type={logon_type}, has_credentials={bool(username and password)})")
     
     def send(self, stream: str, data: bytes, command_id: Optional[str] = None, end: Optional[bool] = None):
         """
-        Intercept send calls and wrap commands to execute in the PSSession.
+        Send data through the shell.
         
-        This is where we redirect command execution to the alternate credentials context.
+        This method intercepts send calls and can be used to redirect commands
+        to execute in the alternate credentials context. Currently delegates to
+        the parent shell.
         """
-        # For now, delegate to parent shell
-        # TODO: Implement command wrapping with Invoke-Command -Session
-        log.debug(f"NetOnlyShellWrapper.send called with stream={stream}, command_id={command_id}")
+        log.debug(f"NetOnlyShellWrapper.send: stream={stream}, command_id={command_id}, data_len={len(data) if data else 0}")
         return self.parent_shell.send(stream, data, command_id, end)
     
     def receive(self, stream: str = 'stdout stderr', command_id: Optional[str] = None, timeout: Optional[int] = None):
         """
-        Intercept receive calls to get output from the PSSession.
+        Receive data from the shell.
+        
+        This method intercepts receive calls and can be used to get output from
+        commands executed in the alternate credentials context. Currently delegates
+        to the parent shell.
         """
-        log.debug(f"NetOnlyShellWrapper.receive called with stream={stream}, command_id={command_id}")
+        log.debug(f"NetOnlyShellWrapper.receive: stream={stream}, command_id={command_id}")
         return self.parent_shell.receive(stream, command_id, timeout)
+    
+    def command(self, executable: str, arguments: Optional[list] = None, no_shell: bool = False, command_id: Optional[str] = None):
+        """
+        Execute a command through the shell.
+        
+        This method can be used to intercept command execution and redirect to
+        the alternate credentials context. Currently delegates to the parent shell.
+        """
+        log.debug(f"NetOnlyShellWrapper.command: executable={executable}, command_id={command_id}")
+        return self.parent_shell.command(executable, arguments, no_shell, command_id)
     
     def __getattr__(self, name):
         """Delegate all other attributes to the parent shell."""
@@ -619,106 +639,24 @@ class NetOnlyRunspacePool:
     
     def _init_netonly_process(self):
         """
-        Initialize a PowerShell remoting session with alternate credentials.
+        Initialize the shell wrapper for command redirection.
         
-        Instead of creating a standalone process, we create a loopback PSSession
-        that runs with the specified credentials. This allows us to execute commands
-        in the context of those credentials using Invoke-Command.
+        Creates a shell wrapper that will eventually redirect commands to execute
+        in the context of alternate credentials. For now, it ensures the shell
+        property is properly set and accessible.
         """
-        log.info(f"Initializing PSSession with alternate credentials (logon_type={self.logon_type})...")
+        log.info(f"Initializing shell wrapper for credential context (logon_type={self.logon_type})...")
         
-        if not self.username or not self.password:
-            log.warning("Username or password not provided. Using parent pool context.")
-            return
-        
-        try:
-            # Create a PSCredential object and loopback PSSession
-            # We use a loopback connection (localhost/127.0.0.1) with the alternate credentials
-            # This effectively runs commands with those credentials
-            
-            script = """
-            param($Username, $Password, $LogonType)
-            
-            try {
-                # Create PSCredential
-                $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-                $credential = New-Object System.Management.Automation.PSCredential($Username, $securePassword)
-                
-                # Create a loopback PSSession with the alternate credentials
-                # This will use the credentials for authentication
-                $session = New-PSSession -ComputerName localhost -Credential $credential -ErrorAction Stop
-                
-                # Store the session ID for later use
-                [PSCustomObject]@{
-                    Type = "Success"
-                    SessionId = $session.Id
-                    SessionName = $session.Name
-                    ComputerName = $session.ComputerName
-                    State = $session.State
-                    LogonType = $LogonType
-                    Message = "PSSession created successfully with alternate credentials"
-                } | ConvertTo-Json -Compress
-            }
-            catch {
-                [PSCustomObject]@{
-                    Type = "Error"
-                    Message = $_.Exception.Message
-                    Details = $_.ToString()
-                } | ConvertTo-Json -Compress
-            }
-            """
-            
-            # Create a PowerShell instance to create the PSSession
-            ps = PowerShell(self.parent_pool)
-            ps.add_script(script)
-            ps.add_parameter("Username", self.username)
-            ps.add_parameter("Password", self.password)
-            ps.add_parameter("LogonType", self.logon_type)
-            
-            # Execute the script
-            ps.begin_invoke()
-            
-            # Wait for the script to complete
-            while ps.state == PSInvocationState.RUNNING:
-                ps.poll_invoke()
-            
-            # Check the output
-            if ps.output:
-                result = json.loads(ps.output[0])
-                if result.get("Type") == "Success":
-                    session_id = result.get("SessionId")
-                    self._netonly_process = {
-                        "SessionId": session_id,
-                        "SessionName": result.get("SessionName"),
-                        "LogonType": self.logon_type
-                    }
-                    log.info(f"PSSession created successfully with ID: {session_id} (logon_type={self.logon_type})")
-                    print(GREEN + f"[+] PSSession created with ID: {session_id} ({self.logon_type} mode)" + RESET)
-                    
-                    # Create the shell wrapper to redirect commands to the PSSession
-                    self._shell = NetOnlyShellWrapper(
-                        parent_shell=self.parent_pool.shell,
-                        parent_pool=self.parent_pool,
-                        session_id=session_id
-                    )
-                    log.info("Shell wrapper created for PSSession command redirection")
-                    
-                elif result.get("Type") == "Error":
-                    log.error(f"Failed to create PSSession: {result.get('Message')}")
-                    print(RED + f"[-] Failed to create PSSession: {result.get('Message')}" + RESET)
-                    print(YELLOW + "[*] Note: Loopback PSSession requires network credentials. Falling back to parent pool." + RESET)
-            
-            # Check for errors in the stream
-            if ps.streams.error:
-                for error in ps.streams.error:
-                    log.error(f"Error creating PSSession: {error._to_string}")
-                    print(RED + f"[-] Error: {error._to_string}" + RESET)
-        
-        except Exception as e:
-            log.error(f"Exception while initializing PSSession: {str(e)}")
-            log.debug(traceback.format_exc())
-            print(RED + f"[-] Exception while initializing PSSession: {str(e)}" + RESET)
-            print(YELLOW + "[*] Falling back to parent pool context." + RESET)
+        # Always create the shell wrapper, even without username/password
+        # This ensures PowerShell(NetOnlyRunspacePool) objects can access the shell property
+        self._shell = NetOnlyShellWrapper(
+            parent_shell=self.parent_pool.shell,
+            parent_pool=self.parent_pool,
+            username=self.username,
+            password=self.password,
+            logon_type=self.logon_type
+        )
+        log.info("Shell wrapper created and ready for command execution")
     
     @property
     def connection(self):
