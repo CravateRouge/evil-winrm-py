@@ -31,6 +31,7 @@ I also wanted to learn more about winrm and its internals, so this project will 
 - Auto-complete local and remote file paths (also the ones which have spaces) with `Tab` completion.
 - Load PowerShell functions from local scripts into the interactive shell. 🆕
 - Run local PowerShell scripts on the remote host. 🆕
+- Interactive logon mode for elevated permissions (useful for COM objects and interactive sessions). 🆕
 - Enable logging and debugging for better traceability.
 - Navigate command history using `up`/`down` arrow keys.
 - Display colorized output for improved readability.
@@ -156,6 +157,7 @@ Menu:
 [+] download <remote_path> <local_path>                     - Download a file
 [+] loadps <local_path>.ps1                                 - Load PowerShell functions from a local script
 [+] runps <local_path>.ps1                                  - Run a local PowerShell script on the remote host
+[+] interactive                                             - Enter interactive logon mode
 [+] menu                                                    - Show this menu
 [+] clear, cls                                              - Clear the screen
 [+] exit                                                    - Exit the shell

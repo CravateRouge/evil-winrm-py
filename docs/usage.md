@@ -153,6 +153,7 @@ Menu:
 [+] download <remote_path> <local_path>                     - Download a file
 [+] loadps <local_path>.ps1                                 - Load PowerShell functions from a local script
 [+] runps <local_path>.ps1                                  - Run a local PowerShell script on the remote host
+[+] interactive                                             - Enter interactive logon mode
 [+] menu                                                    - Show this menu
 [+] clear, cls                                              - Clear the screen
 [+] exit                                                    - Exit the shell
@@ -196,6 +197,79 @@ You can run a local PowerShell script on the remote host using the `runps` comma
 ```bash
 evil-winrm-py PS C:\Users\Administrator\Documents> runps <local_path>.ps1
 ```
+
+### Interactive Logon Mode
+
+By default, WinRM uses a "network" logon type which has fewer permissions than an "interactive" logon type. The interactive logon type is particularly useful when:
+- Using COM objects for privilege escalation (the `NT AUTHORITY\Interactive` group has more permissions on COM objects than `NT AUTHORITY\Network`)
+- Running commands that require an interactive session (e.g., `qwinsta` to display all sessions)
+- Accessing resources that require interactive logon permissions
+
+You can enter interactive logon mode using the `interactive` command:
+
+```bash
+evil-winrm-py PS C:\Users\Administrator\Documents> interactive
+```
+
+#### With Plaintext Password
+
+When you provide a plaintext password (using `-p` flag), the interactive mode will create a new process with interactive logon type, which provides full interactive permissions including network operations:
+
+```bash
+$ evil-winrm-py -i 192.168.100.10 -u john -p 'password'
+evil-winrm-py PS C:\Users\john\Documents> interactive
+[+] Entering interactive logon mode with plaintext credentials.
+[+] This session will have interactive logon type with full permissions.
+evil-winrm-py PS-interactive C:\Users\john\Documents> qwinsta
+ SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE
+ services                                    0  Disc
+>console           john                      1  Active
+evil-winrm-py PS-interactive C:\Users\john\Documents> ([ADSI]"").distinguishedName
+DC=example,DC=com
+evil-winrm-py PS-interactive C:\Users\john\Documents> exit
+evil-winrm-py PS C:\Users\john\Documents>
+```
+
+#### With Hash Only
+
+When you authenticate using a hash (using `-H` flag) instead of a plaintext password, the interactive mode will still work but network operations requiring real credentials may fail:
+
+```bash
+$ evil-winrm-py -i 192.168.100.10 -u john -H 'somehash'
+evil-winrm-py PS C:\Users\john\Documents> interactive
+[!] Plaintext password not provided, using netonly mode.
+[!] Network operations requiring real credentials (like LDAP) may fail.
+evil-winrm-py PS-netonly C:\Users\john\Documents> qwinsta
+ SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE
+ services                                    0  Disc
+>console           john                      1  Active
+evil-winrm-py PS-netonly C:\Users\john\Documents> ([ADSI]"").distinguishedName
+# This may fail with authentication errors
+evil-winrm-py PS-netonly C:\Users\john\Documents> exit
+evil-winrm-py PS C:\Users\john\Documents>
+```
+
+#### With Kerberos Authentication
+
+When you authenticate using Kerberos (using `-k` flag), the interactive mode will use the Kerberos credentials from the ticket cache (TGT or TGS). This works with both password-based Kerberos authentication and ticket-based authentication (using `KRB5CCNAME`):
+
+```bash
+$ export KRB5CCNAME=/path/to/krb5cc_file
+$ evil-winrm-py -i dc01.example.com --kerberos
+evil-winrm-py PS C:\Users\john\Documents> interactive
+[+] Entering interactive logon mode with Kerberos authentication.
+[+] This session will use Kerberos credentials from the ticket cache.
+evil-winrm-py PS-kerberos C:\Users\john\Documents> qwinsta
+ SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE
+ services                                    0  Disc
+>console           john                      1  Active
+evil-winrm-py PS-kerberos C:\Users\john\Documents> ([ADSI]"").distinguishedName
+DC=example,DC=com
+evil-winrm-py PS-kerberos C:\Users\john\Documents> exit
+evil-winrm-py PS C:\Users\john\Documents>
+```
+
+To exit interactive mode and return to the normal shell, simply type `exit`.
 
 ## Additional Options
 

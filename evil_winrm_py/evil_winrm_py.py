@@ -21,6 +21,8 @@ import time
 import traceback
 from importlib import resources
 from pathlib import Path
+from typing import Optional
+
 
 from prompt_toolkit import PromptSession, prompt
 from prompt_toolkit.completion import Completer, Completion
@@ -63,6 +65,7 @@ MENU_COMMANDS = [
     "download",
     "loadps",
     "runps",
+    "interactive",
     "menu",
     "clear",
     "exit",
@@ -123,12 +126,19 @@ def run_ps_cmd(r_pool: RunspacePool, command: str) -> tuple[str, list, bool]:
     return "\n".join(ps.output), ps.streams, ps.had_errors
 
 
-def get_prompt(r_pool: RunspacePool) -> str:
-    """Returns the prompt string for the interactive shell."""
+def get_prompt(r_pool: RunspacePool, mode: str = None) -> str:
+    """Returns the prompt string for the interactive shell.
+    
+    Args:
+        r_pool: The PowerShell runspace pool
+        mode: Optional mode string to display ('interactive' or 'netonly')
+    """
     output, streams, had_errors = run_ps_cmd(
         r_pool, "$pwd.Path"
     )  # Get current working directory
     if not had_errors:
+        if mode:
+            return f"{RED}evil-winrm-py{RESET} {YELLOW}{BOLD}PS-{mode}{RESET} {output}> "
         return f"{RED}evil-winrm-py{RESET} {YELLOW}{BOLD}PS{RESET} {output}> "
     return "PS ?> "  # Fallback prompt
 
@@ -142,6 +152,7 @@ def show_menu() -> None:
         ("download <remote_path> <local_path>", "Download a file"),
         ("loadps <local_path>.ps1", "Load PowerShell functions from a local script"),
         ("runps <local_path>.ps1", "Run a local PowerShell script on the remote host"),
+        ("interactive", "Enter interactive logon mode"),
         ("menu", "Show this menu"),
         ("clear, cls", "Clear the screen"),
         ("exit", "Exit the shell"),
@@ -853,7 +864,13 @@ def run_ps(r_pool: RunspacePool, local_path: str) -> None:
             ps.stop()
 
 
-def interactive_shell(r_pool: RunspacePool) -> None:
+def change_logon_type(r_pool: RunspacePool, username: Optional[str] = None, password: Optional[str] = None) -> None:
+    """Change shell logon type with CreateProcessWithLogonW style execution."""
+    raise NotImplementedError("Interactive logon mode is not implemented yet.")
+
+              
+
+def interactive_shell(r_pool: RunspacePool, username: Optional[str]=None, password: Optional[str]=None) -> None:
     """Runs the interactive pseudo-shell."""
     log.info("Starting interactive PowerShell session...")
 
@@ -895,6 +912,16 @@ def interactive_shell(r_pool: RunspacePool) -> None:
             elif command_lower == "menu":
                 log.info("Displaying menu.")
                 show_menu()
+                continue
+            elif command_lower == "interactive":
+                log.info("Entering interactive mode.")                
+                # Check if we have plaintext password to choose interactive or netonly
+                if password:
+                    print(GREEN + "[+] Entering interactive logon mode with plaintext credentials." + RESET)
+                    change_logon_type(r_pool, username=username, password=password)
+                else:
+                    print(YELLOW + "[!] Plaintext password not provided, using netonly mode with CreateProcessWithLogonW." + RESET)
+                    change_logon_type(r_pool)
                 continue
             elif command_lower.startswith("download"):
                 command_parts = quoted_command_split(command)
@@ -1236,7 +1263,7 @@ def main():
             args.password = prompt("Password: ", is_password=True)
             if not args.password:
                 args.password = None
-
+        
         if username:
             log.info(
                 "[*] Connecting to '{}:{}' as '{}'"
@@ -1267,7 +1294,7 @@ def main():
             user_agent=args.ua,
         ) as wsman:
             with RunspacePool(wsman) as r_pool:
-                interactive_shell(r_pool)
+                interactive_shell(r_pool, username=args.user, password=args.password)
     except (KeyboardInterrupt, EOFError):
         sys.exit(0)
     except WinRMTransportError as wte:
