@@ -108,7 +108,7 @@ evil-winrm-py -i <IP> -u <USERNAME> --priv-key-pem <PRIVATE_KEY_PEM_PATH> --cert
 ```
 
 > [!NOTE]
-> Certificate authentication automatically enables SSL (port 5986) and disables message encryption (not needed with TLS). See the [Certificate Authentication Configuration Guide](knowledgebase.md#configure-winrm-certificate-authentication) for detailed setup instructions on the server side.
+> Certificate authentication can be used with or without SSL. When using SSL (recommended), add the `--ssl` flag to enable HTTPS on port 5986. Message encryption is automatically disabled (set to 'never') when using certificate authentication. See the [Certificate Authentication Configuration Guide](knowledgebase.md#configure-winrm-certificate-authentication) for detailed setup instructions on the server side.
 
 ## Connection Options
 
