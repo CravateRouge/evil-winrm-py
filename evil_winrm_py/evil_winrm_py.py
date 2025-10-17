@@ -1386,7 +1386,6 @@ def main():
     if args.cert_pem or args.priv_key_pem:
         auth = "certificate"
         encryption = "never"
-        args.ssl = True
         args.no_pass = True
         if not args.cert_pem or not args.priv_key_pem:
             print(

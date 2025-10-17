@@ -95,11 +95,20 @@ evil-winrm-py -i <IP> -u <USERNAME> -H <NTLM_HASH>
 
 ### Certificate Authentication
 
-If you want to use certificate-based authentication, you can specify the private key and certificate files in PEM format.
+If you want to use certificate-based authentication, you can specify the private key and certificate files in PEM format. Certificate authentication uses mutual TLS authentication, and the username is extracted from the certificate (optional to specify).
+
+```bash
+evil-winrm-py -i <IP> --priv-key-pem <PRIVATE_KEY_PEM_PATH> --cert-pem <CERT_PEM_PATH>
+```
+
+Or with an explicit username:
 
 ```bash
 evil-winrm-py -i <IP> -u <USERNAME> --priv-key-pem <PRIVATE_KEY_PEM_PATH> --cert-pem <CERT_PEM_PATH>
 ```
+
+> [!NOTE]
+> Certificate authentication can be used with or without SSL. When using SSL (recommended), add the `--ssl` flag to enable HTTPS on port 5986. Message encryption is automatically disabled (set to 'never') when using certificate authentication. See the [Certificate Authentication Configuration Guide](knowledgebase.md#configure-winrm-certificate-authentication) for detailed setup instructions on the server side.
 
 ## Connection Options
 

@@ -418,3 +418,26 @@ class _TransportHTTPEWP(_TransportHTTP):
         build_auth = getattr(self, "_build_auth_%s" % self.auth)
         build_auth(session)
         return session
+
+    def _build_auth_certificate(self, session: requests.Session) -> None:
+        """
+        Override _build_auth_certificate to allow certificate auth without SSL.
+        
+        This is a modified version of pypsrp's _build_auth_certificate that removes
+        the SSL requirement, allowing certificate authentication over HTTP if needed.
+        """
+        if self.certificate_key_pem is None:
+            raise ValueError(
+                "For certificate auth, the path to the "
+                "certificate key pem file must be specified with "
+                "certificate_key_pem"
+            )
+        if self.certificate_pem is None:
+            raise ValueError(
+                "For certificate auth, the path to the "
+                "certificate pem file must be specified with "
+                "certificate_pem"
+            )
+
+        session.cert = (self.certificate_pem, self.certificate_key_pem)
+        session.headers["Authorization"] = "http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual"
